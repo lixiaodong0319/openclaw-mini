@@ -1,0 +1,67 @@
+import Anthropic from "@anthropic-ai/sdk";
+import fs from "node:fs/promises";
+import path from "node:path";
+
+// 简单的泛型 JSONL 会话存储。
+// JSONL 的好处是每条消息可以独立追加，不需要每次把整个会话文件读出、修改、再覆盖写回。
+// 对这个 MVP 来说，它比数据库更容易观察，也方便手动查看一次会话中模型和工具之间发生了什么。
+export class SessionStore<T = Anthropic.MessageParam> {
+  private readonly filePath: string;
+
+  constructor(dataRoot: string, sessionId: string, namespace?: string) {
+    // sessionId 会直接参与生成文件名，所以这里把允许字符限制到非常小的集合。
+    // 这样可以阻止 ../、斜杠、反斜杠、盘符等路径穿越或跨目录写入问题。
+    if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
+      throw new Error("session id may only contain letters, numbers, underscores, and hyphens");
+    }
+    if (namespace !== undefined && !/^[A-Za-z0-9_-]+$/.test(namespace)) {
+      throw new Error("session namespace may only contain letters, numbers, underscores, and hyphens");
+    }
+
+    // 所有会话统一放在 data/sessions 下。
+    // data/ 已在 .gitignore 中忽略，避免把用户对话内容或工具结果误提交。
+    this.filePath = namespace
+      ? path.join(dataRoot, "sessions", namespace, `${sessionId}.jsonl`)
+      : path.join(dataRoot, "sessions", `${sessionId}.jsonl`);
+  }
+
+  async load(): Promise<T[]> {
+    try {
+      const content = await fs.readFile(this.filePath, "utf8");
+      // 过滤空行，允许文件最后以换行结尾。
+      const lines = content.split(/\r?\n/).filter((line) => line.trim().length > 0);
+      return lines.map((line, index) => {
+        try {
+          // Anthropic 会保存完整 MessageParam；OpenAI 会保存完整 Responses input/output item。
+          // 如果只保存最终文本，会导致重启后工具调用链或 reasoning replay 断裂。
+          return JSON.parse(line) as T;
+        } catch (error) {
+          // 损坏的 JSONL 不做静默跳过。
+          // 静默丢弃历史会让模型基于缺失上下文继续工作，比直接报错更难排查。
+          throw new Error(`invalid JSONL at line ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+    } catch (error) {
+      // 新 session 第一次启动时文件不存在，这是正常空历史。
+      // 其他 IO 错误继续抛出，例如权限不足或路径被目录占用。
+      if (isNodeError(error) && error.code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  async append(message: T): Promise<void> {
+    // append 前创建父目录，允许用户直接运行 CLI 而不需要手动创建 data/sessions。
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    // 每条消息一行，按发生顺序追加。
+    // MVP 限定单进程单 session 写入，所以暂不引入文件锁或数据库事务。
+    await fs.appendFile(this.filePath, `${JSON.stringify(message)}\n`, "utf8");
+  }
+}
+
+// Node 的 fs 错误会携带 code 字段。
+// 这里用窄化函数避免在 catch 的 unknown 上直接访问 error.code。
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
+}
