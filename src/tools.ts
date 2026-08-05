@@ -27,6 +27,12 @@ interface ReadTextFileInput {
   path: string;
 }
 
+// list_directory 的模型输入结构。
+// 和 read_text_file 一样只接受 workspace 相对路径；使用 "." 表示 workspace 根目录。
+interface ListDirectoryInput {
+  path: string;
+}
+
 // calculator 的模型输入结构。
 // operation 使用联合类型限定四则运算，避免接收表达式字符串后被迫 eval。
 interface CalculatorInput {
@@ -38,6 +44,9 @@ interface CalculatorInput {
 // 单次读取 1 MiB 是刻意的 MVP 限制。
 // 它既能防止误读大文件撑爆上下文，也让工具错误更容易解释和测试。
 const MAX_FILE_BYTES = 1024 * 1024;
+
+// 限制单次目录列表的规模，防止大型目录一次性占满模型上下文。
+const MAX_DIRECTORY_ENTRIES = 200;
 
 // 这是传给 Claude 的工具清单，也是模型“看得见”的全部外部能力。
 // 工具描述不仅说明工具做什么，也说明什么时候应该调用，帮助模型减少误用。
@@ -59,6 +68,22 @@ export const toolDefinitions: ToolDefinition[] = [
         b: { type: "number", description: "The right operand." },
       },
       required: ["operation", "a", "b"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_directory",
+    description: "Call this to discover files and directories inside the workspace before reading them. Lists one directory level only. Use '.' for the workspace root.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Workspace-relative path to a directory. Use '.' for the workspace root.",
+        },
+      },
+      required: ["path"],
       additionalProperties: false,
     },
   },
@@ -102,11 +127,21 @@ export async function executeTool(
   switch (name) {
     case "calculator":
       return runCalculator(parseCalculatorInput(input));
+    case "list_directory":
+      return listDirectory(parseListDirectoryInput(input), context);
     case "read_text_file":
       return readTextFile(parseReadTextFileInput(input), context);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
+}
+
+function parseListDirectoryInput(input: unknown): ListDirectoryInput {
+  if (!isRecord(input) || typeof input.path !== "string") {
+    throw new Error("list_directory requires a string path");
+  }
+
+  return { path: input.path };
 }
 
 // 工具参数来自模型输出，即使 schema 是 strict，也仍然属于系统边界输入。
@@ -156,33 +191,10 @@ function runCalculator(input: CalculatorInput): string {
 }
 
 async function readTextFile(input: ReadTextFileInput, context: ToolContext): Promise<string> {
-  // 第一层：直接拒绝绝对路径。
-  // 这样模型不能绕过 workspaceRoot，去指定 C:\、/etc 或其他系统位置。
-  if (path.isAbsolute(input.path)) {
-    throw new Error("path must be relative to the workspace");
-  }
-
-  // 第二层：解析 workspace 的真实路径，再把模型给的相对路径拼进去。
-  // path.relative(root, target) 如果以 .. 开头，说明 target 已经在语法层面逃出了 root。
-  // path.isAbsolute(relative) 是 Windows 场景的补充防线，例如不同盘符时 relative 可能表现为绝对路径。
-  const root = await fs.realpath(context.workspaceRoot);
-  const target = path.resolve(root, input.path);
-  const relative = path.relative(root, target);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error("path escapes the workspace");
-  }
-
-  // 第三层：解析目标文件的真实路径后再次检查。
-  // 这一步用于阻止 workspace 内部的符号链接指向外部敏感文件。
-  // 例如 workspace/link -> ../secret.txt，语法路径在 workspace 内，但真实路径已经逃逸。
-  const realTarget = await fs.realpath(target);
-  const realRelative = path.relative(root, realTarget);
-  if (realRelative.startsWith("..") || path.isAbsolute(realRelative)) {
-    throw new Error("path resolves outside the workspace");
-  }
+  const { realTarget } = await resolveWorkspacePath(input.path, context);
 
   // 只允许读取普通文件，不允许读取目录、设备文件或其他特殊文件。
-  // 目录 listing 不是本工具的能力，后续如果需要应单独新增 list_files 工具并独立设计权限。
+  // 目录浏览由 list_directory 独立处理，避免两个工具的能力边界混在一起。
   const stat = await fs.stat(realTarget);
   if (!stat.isFile()) {
     throw new Error("path is not a file");
@@ -194,6 +206,75 @@ async function readTextFile(input: ReadTextFileInput, context: ToolContext): Pro
   // MVP 只按 UTF-8 文本读取。
   // 二进制、图片、PDF 等文件类型需要不同的内容块格式，暂不放进最小工具面。
   return fs.readFile(realTarget, "utf8");
+}
+
+async function listDirectory(input: ListDirectoryInput, context: ToolContext): Promise<string> {
+  const { root, realTarget } = await resolveWorkspacePath(input.path, context);
+  const stat = await fs.stat(realTarget);
+  if (!stat.isDirectory()) {
+    throw new Error("path is not a directory");
+  }
+
+  const allEntries = await fs.readdir(realTarget, { withFileTypes: true });
+  allEntries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+
+  const selectedEntries = allEntries.slice(0, MAX_DIRECTORY_ENTRIES);
+  const entries = await Promise.all(selectedEntries.map(async (entry) => {
+    const type = getDirectoryEntryType(entry);
+    if (type !== "file") {
+      return { name: entry.name, type };
+    }
+
+    // lstat 不跟随符号链接；即使目录内容在读取期间发生变化，也不会借此读取 workspace 外部目标。
+    const entryStat = await fs.lstat(path.join(realTarget, entry.name));
+    return { name: entry.name, type, size: entryStat.size };
+  }));
+
+  const relativePath = path.relative(root, realTarget);
+  return JSON.stringify({
+    path: relativePath.length === 0 ? "." : relativePath.split(path.sep).join("/"),
+    entries,
+    truncated: allEntries.length > MAX_DIRECTORY_ENTRIES,
+  }, null, 2);
+}
+
+function getDirectoryEntryType(entry: import("node:fs").Dirent): "file" | "directory" | "symbolic_link" | "other" {
+  if (entry.isFile()) return "file";
+  if (entry.isDirectory()) return "directory";
+  if (entry.isSymbolicLink()) return "symbolic_link";
+  return "other";
+}
+
+async function resolveWorkspacePath(
+  requestedPath: string,
+  context: ToolContext,
+): Promise<{ root: string; realTarget: string }> {
+  // 第一层：直接拒绝绝对路径。
+  // 这样模型不能绕过 workspaceRoot，去指定 C:\、/etc 或其他系统位置。
+  if (path.isAbsolute(requestedPath)) {
+    throw new Error("path must be relative to the workspace");
+  }
+
+  // 第二层：在语法路径层面阻止 .. 逃逸。
+  const root = await fs.realpath(context.workspaceRoot);
+  const target = path.resolve(root, requestedPath);
+  const relative = path.relative(root, target);
+  if (isOutsideRoot(relative)) {
+    throw new Error("path escapes the workspace");
+  }
+
+  // 第三层：检查真实路径，阻止 workspace 内的符号链接指向外部位置。
+  const realTarget = await fs.realpath(target);
+  const realRelative = path.relative(root, realTarget);
+  if (isOutsideRoot(realRelative)) {
+    throw new Error("path resolves outside the workspace");
+  }
+
+  return { root, realTarget };
+}
+
+function isOutsideRoot(relativePath: string): boolean {
+  return relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath);
 }
 
 // 判断 unknown 是否为普通对象，供工具参数解析复用。

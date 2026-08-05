@@ -1,10 +1,6 @@
 import { executeTool, type ToolContext } from "./tools.js";
 
-export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.
-Answer concisely and directly.
-Use calculator when arithmetic is needed.
-Use read_text_file only for files inside the configured workspace.
-You cannot write files, run shell commands, browse the web, or access files outside the workspace.`;
+export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.`;
 
 export interface ToolCallRequest {
   id: string;

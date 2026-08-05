@@ -8,8 +8,9 @@
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
-- 两个最小工具：
+- 三个最小工具：
   - `calculator`：执行加、减、乘、除
+  - `list_directory`：浏览 `workspace/` 内的一层目录
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
 - JSONL 会话持久化，支持重启后继续同一 session
 - Fake Provider 测试，不依赖真实 API Key 或网络
@@ -132,10 +133,11 @@ pnpm dev -- --session demo
 然后在 REPL 中输入：
 
 ```text
+> 查看 workspace 里有哪些文件
 > 读取 note.txt 并总结内容
 ```
 
-`read_text_file` 只能读取 `workspace/` 内文件。读取 `../package.json`、绝对路径或符号链接逃逸到 workspace 外的文件都会被拒绝。
+`list_directory` 和 `read_text_file` 只能访问 `workspace/`。访问 `../`、绝对路径或通过符号链接逃逸到 workspace 外都会被拒绝。目录浏览每次只返回一层，最多返回 200 项。
 
 OpenAI 和 Anthropic 使用独立的会话文件；相同 `--session` 名称不会混用两种 API 的历史格式。
 
@@ -176,6 +178,7 @@ pnpm run build
 - 普通模型文本回复
 - 单工具调用
 - 多工具并行调用
+- 目录浏览、排序、非递归和数量上限
 - 工具错误转为 `tool_result` 错误
 - OpenAI reasoning item 回放和 `function_call_output`
 - refusal 和迭代上限
@@ -188,8 +191,7 @@ pnpm run build
 
 1. 流式输出
 2. 更完整的工具确认机制
-3. 只读目录列表工具
-4. 文件编辑工具
-5. 上下文压缩或摘要
-6. 多模型或 fallback
-7. Web UI
+3. 文件编辑工具
+4. 上下文压缩或摘要
+5. 多模型或 fallback
+6. Web UI
