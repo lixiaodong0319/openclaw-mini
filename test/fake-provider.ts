@@ -1,12 +1,15 @@
 import Anthropic from "@anthropic-ai/sdk";
+import type { TextDeltaHandler } from "../src/agent-loop.js";
 import type { MessageProvider } from "../src/provider.js";
 
 export class FakeProvider implements MessageProvider {
   readonly calls: Anthropic.MessageCreateParamsNonStreaming[] = [];
   private readonly responses: Anthropic.Message[];
+  private readonly textChunks: string[][];
 
-  constructor(responses: Anthropic.Message[]) {
+  constructor(responses: Anthropic.Message[], textChunks: string[][] = []) {
     this.responses = [...responses];
+    this.textChunks = [...textChunks];
   }
 
   async createMessage(params: Anthropic.MessageCreateParamsNonStreaming): Promise<Anthropic.Message> {
@@ -15,6 +18,18 @@ export class FakeProvider implements MessageProvider {
     if (!response) {
       throw new Error("FakeProvider has no response queued");
     }
+    return response;
+  }
+
+  async streamMessage(
+    params: Anthropic.MessageCreateParamsNonStreaming,
+    onTextDelta: TextDeltaHandler,
+  ): Promise<Anthropic.Message> {
+    const response = await this.createMessage(params);
+    const chunks = this.textChunks.shift() ?? response.content
+      .filter((block): block is Anthropic.TextBlock => block.type === "text")
+      .map((block) => block.text);
+    for (const chunk of chunks) onTextDelta(chunk);
     return response;
   }
 }

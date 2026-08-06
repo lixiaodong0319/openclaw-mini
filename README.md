@@ -5,6 +5,7 @@
 ## 功能
 
 - 本地命令行 REPL 对话
+- 模型文本流式输出，显示工具执行中、完成和失败状态
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
@@ -114,6 +115,14 @@ pnpm dev -- --session smoke
 /exit
 ```
 
+模型生成的文本会直接流式显示。发生工具调用时，终端会显示执行状态：
+
+```text
+[工具] list_directory 执行中...
+[工具] list_directory 完成
+workspace 中包含 note.txt。
+```
+
 ## 使用示例
 
 计算：
@@ -175,6 +184,9 @@ pnpm run build
 
 当前测试覆盖：
 
+- Anthropic 与 OpenAI 文本增量转发
+- OpenAI Responses API SSE 分块解析
+- 工具开始、完成和失败事件
 - 普通模型文本回复
 - 单工具调用
 - 多工具并行调用
@@ -189,9 +201,8 @@ pnpm run build
 
 这个项目适合作为最小 Agent Loop 学习样例。后续如果要继续扩展，建议按顺序增加：
 
-1. 流式输出
-2. 更完整的工具确认机制
-3. 文件编辑工具
-4. 上下文压缩或摘要
-5. 多模型或 fallback
-6. Web UI
+1. 更完整的工具确认机制
+2. 文件编辑工具
+3. 上下文压缩或摘要
+4. 多模型或 fallback
+5. Web UI

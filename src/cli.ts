@@ -3,7 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { AgentLoop } from "./agent-loop.js";
+import { AgentLoop, type AgentEvent } from "./agent-loop.js";
 import {
   AnthropicProvider,
   OpenAIAPIError,
@@ -24,7 +24,7 @@ async function main(): Promise<void> {
   const providerName = getProviderName();
   const projectRoot = process.cwd();
 
-  // workspace 是 Agent 唯一能通过 read_text_file 访问的目录。
+  // workspace 是 Agent 唯一能通过目录浏览和文件读取工具访问的目录。
   // data 只用于宿主程序存会话，不作为工具 workspace 暴露给模型。
   // 这两个目录分离，可以降低模型读取自身历史或内部状态的机会。
   const workspaceRoot = path.join(projectRoot, "workspace");
@@ -54,10 +54,12 @@ async function main(): Promise<void> {
         break;
       }
 
+      const renderer = createTurnRenderer();
       try {
-        const result = await agent.runTurn(line);
-        console.log(`${result.text}\n`);
+        await agent.runTurn(line, renderer.handle);
+        renderer.finish();
       } catch (error) {
+        renderer.finish();
         // 单轮失败不退出 REPL，用户可以修正输入、配置 API Key 后继续尝试。
         console.error(formatError(error));
       }
@@ -65,6 +67,39 @@ async function main(): Promise<void> {
   } finally {
     rl.close();
   }
+}
+
+function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: () => void } {
+  let lineOpen = false;
+  let finished = false;
+
+  const writeStatus = (message: string): void => {
+    if (lineOpen) output.write("\n");
+    output.write(`[工具] ${message}\n`);
+    lineOpen = false;
+  };
+
+  return {
+    handle: (event) => {
+      if (event.type === "text_delta") {
+        if (event.text.length === 0) return;
+        output.write(event.text);
+        lineOpen = !event.text.endsWith("\n");
+        return;
+      }
+      if (event.type === "tool_start") {
+        writeStatus(`${event.name} 执行中...`);
+        return;
+      }
+      writeStatus(`${event.name} ${event.isError ? "失败" : "完成"}`);
+    },
+    finish: () => {
+      if (finished) return;
+      if (lineOpen) output.write("\n");
+      output.write("\n");
+      finished = true;
+    },
+  };
 }
 
 async function createAgent(

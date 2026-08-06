@@ -15,6 +15,14 @@ export interface ToolExecutionResult {
   isError: boolean;
 }
 
+export type AgentEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "tool_start"; toolCallId: string; name: string }
+  | { type: "tool_end"; toolCallId: string; name: string; isError: boolean };
+
+export type AgentEventHandler = (event: AgentEvent) => void;
+export type TextDeltaHandler = (text: string) => void;
+
 export type ProviderTurn =
   | {
       type: "tool_calls";
@@ -30,7 +38,7 @@ export type ProviderTurn =
 // 各 Provider 负责把统一动作转换成自己的 API 格式，并保存必须原样回放的原生历史。
 export interface AgentProvider {
   addUserText(text: string): Promise<void>;
-  generateTurn(instructions: string): Promise<ProviderTurn>;
+  generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn>;
   addToolResults(results: ToolExecutionResult[]): Promise<void>;
 }
 
@@ -61,39 +69,71 @@ export class AgentLoop {
     this.maxIterations = options.maxIterations ?? 8;
   }
 
-  async runTurn(userText: string): Promise<TurnResult> {
+  async runTurn(userText: string, onEvent?: AgentEventHandler): Promise<TurnResult> {
     await this.provider.addUserText(userText);
 
     for (let iteration = 0; iteration < this.maxIterations; iteration += 1) {
-      const turn = await this.provider.generateTurn(this.systemPrompt);
+      let streamedText = "";
+      const turn = await this.provider.generateTurn(this.systemPrompt, onEvent ? (text) => {
+        streamedText += text;
+        onEvent({ type: "text_delta", text });
+      } : undefined);
       if (turn.type === "final") {
+        emitUnstreamedFinalText(turn.text, streamedText, onEvent);
         return { text: turn.text, stopReason: turn.stopReason };
       }
 
       const results = await Promise.all(
         turn.calls.map(async (call): Promise<ToolExecutionResult> => {
+          onEvent?.({ type: "tool_start", toolCallId: call.id, name: call.name });
+          let result: ToolExecutionResult;
           try {
             if (call.inputError) {
               throw new Error(call.inputError);
             }
-            return {
+            result = {
               toolCallId: call.id,
               output: await executeTool(call.name, call.input, this.toolContext),
               isError: false,
             };
           } catch (error) {
-            return {
+            result = {
               toolCallId: call.id,
               output: error instanceof Error ? error.message : String(error),
               isError: true,
             };
           }
+          onEvent?.({ type: "tool_end", toolCallId: call.id, name: call.name, isError: result.isError });
+          return result;
         }),
       );
 
       await this.provider.addToolResults(results);
     }
 
-    return { text: "Agent Loop 达到最大工具迭代次数。", stopReason: "iteration_limit" };
+    const text = "Agent Loop 达到最大工具迭代次数。";
+    emitUnstreamedFinalText(text, "", onEvent);
+    return { text, stopReason: "iteration_limit" };
+  }
+}
+
+function emitUnstreamedFinalText(
+  finalText: string,
+  streamedText: string,
+  onEvent?: AgentEventHandler,
+): void {
+  if (!onEvent || finalText.length === 0) return;
+  if (streamedText.length === 0) {
+    onEvent({ type: "text_delta", text: finalText });
+    return;
+  }
+
+  // Provider 的最终文本可能追加 max_tokens / incomplete 提示；只补发未出现在流中的后缀。
+  const normalizedStreamedText = streamedText.trim();
+  if (normalizedStreamedText.length > 0 && finalText.startsWith(normalizedStreamedText)) {
+    const suffix = finalText.slice(normalizedStreamedText.length);
+    if (suffix.length > 0) {
+      onEvent({ type: "text_delta", text: suffix });
+    }
   }
 }

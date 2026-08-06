@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type {
   AgentProvider,
   ProviderTurn,
+  TextDeltaHandler,
   ToolExecutionResult,
 } from "./agent-loop.js";
 import {
@@ -13,6 +14,10 @@ import {
 // 低层客户端接口用于注入官方 SDK 或 Fake Provider。
 export interface MessageProvider {
   createMessage(params: Anthropic.MessageCreateParamsNonStreaming): Promise<Anthropic.Message>;
+  streamMessage?(
+    params: Anthropic.MessageCreateParamsNonStreaming,
+    onTextDelta: TextDeltaHandler,
+  ): Promise<Anthropic.Message>;
 }
 
 export interface AnthropicProviderOptions {
@@ -53,8 +58,8 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
     await this.addMessage({ role: "user", content: [{ type: "text", text }] });
   }
 
-  async generateTurn(instructions: string): Promise<ProviderTurn> {
-    const response = await this.client.createMessage({
+  async generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn> {
+    const params: Anthropic.MessageCreateParamsNonStreaming = {
       model: this.model,
       max_tokens: 16000,
       thinking: { type: "adaptive" },
@@ -62,7 +67,10 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
       system: [{ type: "text", text: instructions }],
       tools: toolDefinitions,
       messages: normalizeMessages(this.messages),
-    });
+    };
+    const response = onTextDelta && this.client.streamMessage
+      ? await this.client.streamMessage(params, onTextDelta)
+      : await this.client.createMessage(params);
 
     // thinking、tool_use 和 text blocks 必须原样保存，后续请求才能正确 replay。
     await this.addMessage({ role: "assistant", content: response.content });
@@ -133,6 +141,15 @@ class AnthropicSDKClient implements MessageProvider {
   createMessage(params: Anthropic.MessageCreateParamsNonStreaming): Promise<Anthropic.Message> {
     return this.client.messages.create(params);
   }
+
+  async streamMessage(
+    params: Anthropic.MessageCreateParamsNonStreaming,
+    onTextDelta: TextDeltaHandler,
+  ): Promise<Anthropic.Message> {
+    const stream = this.client.messages.stream(params);
+    stream.on("text", (textDelta) => onTextDelta(textDelta));
+    return stream.finalMessage();
+  }
 }
 
 export function getModelId(): string {
@@ -194,6 +211,10 @@ export interface OpenAIResponseCreateParams {
 
 export interface OpenAIResponseClient {
   createResponse(params: OpenAIResponseCreateParams): Promise<OpenAIResponse>;
+  streamResponse?(
+    params: OpenAIResponseCreateParams,
+    onTextDelta: TextDeltaHandler,
+  ): Promise<OpenAIResponse>;
 }
 
 export interface OpenAIClientOptions {
@@ -269,13 +290,16 @@ export class OpenAIProvider implements AgentProvider {
     await this.addOpenAIItem({ role: "user", content: text });
   }
 
-  async generateTurn(instructions: string): Promise<ProviderTurn> {
-    const response = await this.client.createResponse({
+  async generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn> {
+    const params: OpenAIResponseCreateParams = {
       model: this.model,
       instructions,
       input: this.input,
       tools: openAIToolDefinitions,
-    });
+    };
+    const response = onTextDelta && this.client.streamResponse
+      ? await this.client.streamResponse(params, onTextDelta)
+      : await this.client.createResponse(params);
 
     // 官方流程要求完整回放 response.output；reasoning item 也必须保留。
     await this.addOpenAIItems(response.output);
@@ -355,6 +379,36 @@ export class OpenAIHTTPClient implements OpenAIResponseClient {
   }
 
   async createResponse(params: OpenAIResponseCreateParams): Promise<OpenAIResponse> {
+    const response = await this.request(params, false);
+    const payload = await parseOpenAIJsonResponse(response);
+    if (!response.ok) {
+      throwOpenAIResponseError(response.status, payload);
+    }
+    return parseOpenAIResponse(payload, response.status);
+  }
+
+  async streamResponse(
+    params: OpenAIResponseCreateParams,
+    onTextDelta: TextDeltaHandler,
+  ): Promise<OpenAIResponse> {
+    const response = await this.request(params, true);
+    if (!response.ok) {
+      const payload = await parseOpenAIJsonResponse(response);
+      throwOpenAIResponseError(response.status, payload);
+    }
+    if (!response.body) {
+      throw new OpenAIAPIError("OpenAI streaming response has no body", { status: response.status });
+    }
+
+    try {
+      return await readOpenAIResponseStream(response.body, onTextDelta, response.status);
+    } catch (error) {
+      if (error instanceof OpenAIAPIError) throw error;
+      throw new OpenAIConnectionError(error instanceof Error ? error.message : String(error), { cause: error });
+    }
+  }
+
+  private async request(params: OpenAIResponseCreateParams, stream: boolean): Promise<Response> {
     if (!this.apiKey) {
       throw new OpenAIAuthenticationError("OPENAI_API_KEY is required when OPENCLAW_PROVIDER=openai");
     }
@@ -363,6 +417,7 @@ export class OpenAIHTTPClient implements OpenAIResponseClient {
       Authorization: `Bearer ${this.apiKey}`,
       "Content-Type": "application/json",
     };
+    if (stream) headers.Accept = "text/event-stream";
     if (this.organization) headers["OpenAI-Organization"] = this.organization;
     if (this.project) headers["OpenAI-Project"] = this.project;
 
@@ -371,29 +426,12 @@ export class OpenAIHTTPClient implements OpenAIResponseClient {
       response = await this.fetchImpl(`${this.baseURL}/responses`, {
         method: "POST",
         headers,
-        body: JSON.stringify(params),
+        body: JSON.stringify(stream ? { ...params, stream: true } : params),
       });
     } catch (error) {
       throw new OpenAIConnectionError(error instanceof Error ? error.message : String(error), { cause: error });
     }
-
-    const payload = await parseOpenAIJsonResponse(response);
-    if (!response.ok) {
-      const apiError = extractOpenAIAPIError(payload);
-      const options = { status: response.status, code: apiError.code };
-      if (response.status === 401 || response.status === 403) {
-        throw new OpenAIAuthenticationError(apiError.message, options);
-      }
-      if (response.status === 429) {
-        throw new OpenAIRateLimitError(apiError.message, options);
-      }
-      throw new OpenAIAPIError(apiError.message, options);
-    }
-
-    if (!isRecord(payload) || typeof payload.id !== "string" || !Array.isArray(payload.output)) {
-      throw new OpenAIAPIError("OpenAI Responses API returned an invalid response shape", { status: response.status });
-    }
-    return payload as unknown as OpenAIResponse;
+    return response;
   }
 }
 
@@ -453,6 +491,90 @@ async function parseOpenAIJsonResponse(response: Response): Promise<unknown> {
     if (!response.ok) return { error: { message: text } };
     throw new OpenAIAPIError("OpenAI Responses API returned non-JSON content", { status: response.status });
   }
+}
+
+function parseOpenAIResponse(payload: unknown, status: number): OpenAIResponse {
+  if (!isRecord(payload) || typeof payload.id !== "string" || !Array.isArray(payload.output)) {
+    throw new OpenAIAPIError("OpenAI Responses API returned an invalid response shape", { status });
+  }
+  return payload as unknown as OpenAIResponse;
+}
+
+function throwOpenAIResponseError(status: number, payload: unknown): never {
+  const apiError = extractOpenAIAPIError(payload);
+  const options = { status, code: apiError.code };
+  if (status === 401 || status === 403) {
+    throw new OpenAIAuthenticationError(apiError.message, options);
+  }
+  if (status === 429) {
+    throw new OpenAIRateLimitError(apiError.message, options);
+  }
+  throw new OpenAIAPIError(apiError.message, options);
+}
+
+async function readOpenAIResponseStream(
+  body: ReadableStream<Uint8Array>,
+  onTextDelta: TextDeltaHandler,
+  status: number,
+): Promise<OpenAIResponse> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResponse: OpenAIResponse | undefined;
+
+  const consumeBlock = (block: string): void => {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (data.length === 0 || data === "[DONE]") return;
+
+    let event: unknown;
+    try {
+      event = JSON.parse(data) as unknown;
+    } catch (error) {
+      throw new OpenAIAPIError(`OpenAI stream returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`, { status });
+    }
+    if (!isRecord(event) || typeof event.type !== "string") return;
+
+    if ((event.type === "response.output_text.delta" || event.type === "response.refusal.delta")
+      && typeof event.delta === "string") {
+      onTextDelta(event.delta);
+      return;
+    }
+    if (event.type === "error") {
+      const message = typeof event.message === "string" ? event.message : "OpenAI streaming response failed";
+      const code = typeof event.code === "string" ? event.code : undefined;
+      throw new OpenAIAPIError(message, { status, code });
+    }
+    if ((event.type === "response.completed" || event.type === "response.failed" || event.type === "response.incomplete")
+      && "response" in event) {
+      finalResponse = parseOpenAIResponse(event.response, status);
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+
+    let boundary = /\r?\n\r?\n/.exec(buffer);
+    while (boundary) {
+      consumeBlock(buffer.slice(0, boundary.index));
+      buffer = buffer.slice(boundary.index + boundary[0].length);
+      boundary = /\r?\n\r?\n/.exec(buffer);
+    }
+
+    if (done) break;
+  }
+
+  if (buffer.trim().length > 0) {
+    consumeBlock(buffer);
+  }
+  if (!finalResponse) {
+    throw new OpenAIAPIError("OpenAI stream ended without a completed response", { status });
+  }
+  return finalResponse;
 }
 
 function extractOpenAIAPIError(payload: unknown): { message: string; code?: string } {

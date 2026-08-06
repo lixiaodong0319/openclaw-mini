@@ -123,7 +123,6 @@ export async function executeTool(
   input: unknown,
   context: ToolContext,
 ): Promise<string> {
-  console.log("执行工具:", name, input, context);
   switch (name) {
     case "calculator":
       return runCalculator(parseCalculatorInput(input));

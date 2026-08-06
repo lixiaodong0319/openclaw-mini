@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { AgentLoop } from "../src/agent-loop.js";
+import { AgentLoop, type AgentEvent } from "../src/agent-loop.js";
 import { AnthropicProvider, type MessageProvider } from "../src/provider.js";
 import { FakeProvider, message } from "./fake-provider.js";
 
@@ -55,6 +55,41 @@ describe("AgentLoop", () => {
     expect(persisted).toHaveLength(2);
   });
 
+  it("forwards streamed text deltas", async () => {
+    const provider = new FakeProvider(
+      [message([textBlock("hello")], "end_turn")],
+      [["hel", "lo"]],
+    );
+    const loop = createLoop(provider, [], workspaceRoot);
+    const events: AgentEvent[] = [];
+
+    await loop.runTurn("hi", (event) => events.push(event));
+
+    expect(events).toEqual([
+      { type: "text_delta", text: "hel" },
+      { type: "text_delta", text: "lo" },
+    ]);
+  });
+
+  it("emits tool start and completion events", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_1", "calculator", { operation: "add", a: 1, b: 2 })], "tool_use"),
+      message([textBlock("3")], "end_turn"),
+    ]);
+    const loop = createLoop(provider, [], workspaceRoot);
+    const events: AgentEvent[] = [];
+
+    await loop.runTurn("1+2", (event) => events.push(event));
+
+    expect(events).toContainEqual({ type: "tool_start", toolCallId: "toolu_1", name: "calculator" });
+    expect(events).toContainEqual({
+      type: "tool_end",
+      toolCallId: "toolu_1",
+      name: "calculator",
+      isError: false,
+    });
+  });
+
   it("executes a tool and returns the follow-up text", async () => {
     const provider = new FakeProvider([
       message([toolUseBlock("toolu_1", "calculator", { operation: "multiply", a: 6, b: 7 })], "tool_use"),
@@ -102,8 +137,9 @@ describe("AgentLoop", () => {
     ]);
     const messages: Anthropic.MessageParam[] = [];
     const loop = createLoop(provider, messages, workspaceRoot);
+    const events: AgentEvent[] = [];
 
-    await loop.runTurn("divide");
+    await loop.runTurn("divide", (event) => events.push(event));
 
     expect(messages[2]).toEqual({
       role: "user",
@@ -113,6 +149,12 @@ describe("AgentLoop", () => {
         content: [{ type: "text", text: "division by zero is not allowed" }],
         is_error: true,
       }],
+    });
+    expect(events).toContainEqual({
+      type: "tool_end",
+      toolCallId: "toolu_1",
+      name: "calculator",
+      isError: true,
     });
   });
 

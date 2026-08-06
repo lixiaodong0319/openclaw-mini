@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { AgentLoop } from "../src/agent-loop.js";
+import { AgentLoop, type AgentEvent } from "../src/agent-loop.js";
 import { OpenAIProvider, type OpenAIInputItem, type OpenAIResponseItem } from "../src/provider.js";
 import { openAIResponse, FakeOpenAIProvider } from "./fake-openai-provider.js";
 
@@ -63,6 +63,22 @@ describe("OpenAIProvider adapter", () => {
 
     await expect(loop.runTurn("hi")).resolves.toEqual({ text: "hello", stopReason: "completed" });
     expect(persisted).toHaveLength(2);
+  });
+
+  it("forwards Responses API text deltas", async () => {
+    const client = new FakeOpenAIProvider(
+      [openAIResponse([outputMessage("hello")])],
+      [["hel", "lo"]],
+    );
+    const loop = createLoop(client, [], workspaceRoot);
+    const events: AgentEvent[] = [];
+
+    await loop.runTurn("hi", (event) => events.push(event));
+
+    expect(events).toEqual([
+      { type: "text_delta", text: "hel" },
+      { type: "text_delta", text: "lo" },
+    ]);
   });
 
   it("preserves reasoning items and returns function output", async () => {
