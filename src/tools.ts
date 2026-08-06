@@ -27,6 +27,21 @@ interface ReadTextFileInput {
   path: string;
 }
 
+// write_text_file 只接受完整的 UTF-8 文本内容。
+// 写入是有副作用的操作，因此它不在自动放行列表中。
+interface WriteTextFileInput {
+  path: string;
+  content: string;
+}
+
+// edit_text_file 使用“唯一原文 -> 新文”做精确替换。
+// 比起覆盖整个文件，它更适合小范围修改，也能防止模型用过时上下文误改文件。
+interface EditTextFileInput {
+  path: string;
+  oldText: string;
+  newText: string;
+}
+
 // list_directory 的模型输入结构。
 // 和 read_text_file 一样只接受 workspace 相对路径；使用 "." 表示 workspace 根目录。
 interface ListDirectoryInput {
@@ -47,6 +62,14 @@ const MAX_FILE_BYTES = 1024 * 1024;
 
 // 限制单次目录列表的规模，防止大型目录一次性占满模型上下文。
 const MAX_DIRECTORY_ENTRIES = 200;
+
+// 当前三个工具都是只读或纯计算能力，可以直接执行。
+// 未登记的新工具默认需要用户确认，避免未来加入写文件、Shell 等能力时意外绕过审批。
+const AUTO_APPROVED_TOOLS = new Set(["calculator", "list_directory", "read_text_file"]);
+
+export function requiresToolConfirmation(name: string): boolean {
+  return !AUTO_APPROVED_TOOLS.has(name);
+}
 
 // 这是传给 Claude 的工具清单，也是模型“看得见”的全部外部能力。
 // 工具描述不仅说明工具做什么，也说明什么时候应该调用，帮助模型减少误用。
@@ -103,6 +126,50 @@ export const toolDefinitions: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "write_text_file",
+    description: "Call this to create or overwrite a UTF-8 text file inside the workspace. The user must approve every write before it executes. The parent directory must already exist.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Workspace-relative path to the text file to create or overwrite.",
+        },
+        content: {
+          type: "string",
+          description: "The complete UTF-8 text content to write.",
+        },
+      },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "edit_text_file",
+    description: "Call this to replace one exact, uniquely occurring text block in an existing UTF-8 workspace file. Read the file first and provide enough surrounding text to make old_text unique. The user must approve every edit.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Workspace-relative path to an existing UTF-8 text file.",
+        },
+        old_text: {
+          type: "string",
+          description: "Exact existing text to replace. It must be non-empty and occur exactly once.",
+        },
+        new_text: {
+          type: "string",
+          description: "Replacement text. Use an empty string to delete the matched block.",
+        },
+      },
+      required: ["path", "old_text", "new_text"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 // OpenAI Responses API 使用 parameters 字段描述函数参数。
@@ -130,6 +197,10 @@ export async function executeTool(
       return listDirectory(parseListDirectoryInput(input), context);
     case "read_text_file":
       return readTextFile(parseReadTextFileInput(input), context);
+    case "write_text_file":
+      return writeTextFile(parseWriteTextFileInput(input), context);
+    case "edit_text_file":
+      return editTextFile(parseEditTextFileInput(input), context);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -151,6 +222,34 @@ function parseReadTextFileInput(input: unknown): ReadTextFileInput {
   }
 
   return { path: input.path };
+}
+
+function parseWriteTextFileInput(input: unknown): WriteTextFileInput {
+  if (!isRecord(input) || typeof input.path !== "string" || typeof input.content !== "string") {
+    throw new Error("write_text_file requires string path and content");
+  }
+
+  return { path: input.path, content: input.content };
+}
+
+function parseEditTextFileInput(input: unknown): EditTextFileInput {
+  if (
+    !isRecord(input)
+    || typeof input.path !== "string"
+    || typeof input.old_text !== "string"
+    || typeof input.new_text !== "string"
+  ) {
+    throw new Error("edit_text_file requires string path, old_text, and new_text");
+  }
+  if (input.old_text.length === 0) {
+    throw new Error("edit_text_file old_text must not be empty");
+  }
+
+  return {
+    path: input.path,
+    oldText: input.old_text,
+    newText: input.new_text,
+  };
 }
 
 // calculator 参数校验分两层：先校验 operation 是否属于枚举，再校验两个操作数是否为有限数字。
@@ -205,6 +304,70 @@ async function readTextFile(input: ReadTextFileInput, context: ToolContext): Pro
   // MVP 只按 UTF-8 文本读取。
   // 二进制、图片、PDF 等文件类型需要不同的内容块格式，暂不放进最小工具面。
   return fs.readFile(realTarget, "utf8");
+}
+
+async function writeTextFile(input: WriteTextFileInput, context: ToolContext): Promise<string> {
+  const bytes = Buffer.byteLength(input.content, "utf8");
+  if (bytes > MAX_FILE_BYTES) {
+    throw new Error(`content is too large; maximum is ${MAX_FILE_BYTES} bytes`);
+  }
+
+  const { root, target, existed } = await resolveWorkspaceWritePath(input.path, context);
+  await fs.writeFile(target, input.content, "utf8");
+
+  const relativePath = path.relative(root, target).split(path.sep).join("/");
+  return JSON.stringify({
+    path: relativePath,
+    bytes,
+    created: !existed,
+  }, null, 2);
+}
+
+async function editTextFile(input: EditTextFileInput, context: ToolContext): Promise<string> {
+  const { root, target, existed } = await resolveWorkspaceWritePath(input.path, context);
+  if (!existed) {
+    throw new Error("path does not exist");
+  }
+
+  const stat = await fs.stat(target);
+  if (stat.size > MAX_FILE_BYTES) {
+    throw new Error(`file is too large; maximum is ${MAX_FILE_BYTES} bytes`);
+  }
+
+  const content = await fs.readFile(target, "utf8");
+  const matchIndex = content.indexOf(input.oldText);
+  if (matchIndex === -1) {
+    throw new Error("old_text was not found");
+  }
+  if (content.indexOf(input.oldText, matchIndex + 1) !== -1) {
+    throw new Error("old_text occurs more than once; include more surrounding text");
+  }
+
+  const updatedContent = `${content.slice(0, matchIndex)}${input.newText}${content.slice(matchIndex + input.oldText.length)}`;
+  const bytes = Buffer.byteLength(updatedContent, "utf8");
+  if (bytes > MAX_FILE_BYTES) {
+    throw new Error(`edited content is too large; maximum is ${MAX_FILE_BYTES} bytes`);
+  }
+
+  await fs.writeFile(target, updatedContent, "utf8");
+
+  const beforeMatch = content.slice(0, matchIndex);
+  const lastNewlineIndex = beforeMatch.lastIndexOf("\n");
+  return JSON.stringify({
+    path: path.relative(root, target).split(path.sep).join("/"),
+    replacements: 1,
+    line: countLineBreaks(beforeMatch) + 1,
+    column: matchIndex - lastNewlineIndex,
+    bytes,
+  }, null, 2);
+}
+
+function countLineBreaks(text: string): number {
+  let count = 0;
+  for (const character of text) {
+    if (character === "\n") count += 1;
+  }
+  return count;
 }
 
 async function listDirectory(input: ListDirectoryInput, context: ToolContext): Promise<string> {
@@ -272,8 +435,74 @@ async function resolveWorkspacePath(
   return { root, realTarget };
 }
 
+async function resolveWorkspaceWritePath(
+  requestedPath: string,
+  context: ToolContext,
+): Promise<{ root: string; target: string; existed: boolean }> {
+  if (path.isAbsolute(requestedPath)) {
+    throw new Error("path must be relative to the workspace");
+  }
+
+  const root = await fs.realpath(context.workspaceRoot);
+  const target = path.resolve(root, requestedPath);
+  const relative = path.relative(root, target);
+  if (isOutsideRoot(relative)) {
+    throw new Error("path escapes the workspace");
+  }
+
+  let targetStat: import("node:fs").Stats | undefined;
+  try {
+    targetStat = await fs.lstat(target);
+  } catch (error) {
+    if (!isFileSystemError(error, "ENOENT")) {
+      throw error;
+    }
+  }
+
+  if (targetStat) {
+    if (targetStat.isSymbolicLink()) {
+      throw new Error("write target must not be a symbolic link");
+    }
+    if (!targetStat.isFile()) {
+      throw new Error("path is not a file");
+    }
+
+    const realTarget = await fs.realpath(target);
+    const realRelative = path.relative(root, realTarget);
+    if (isOutsideRoot(realRelative)) {
+      throw new Error("path resolves outside the workspace");
+    }
+    return { root, target: realTarget, existed: true };
+  }
+
+  let realParent: string;
+  try {
+    realParent = await fs.realpath(path.dirname(target));
+  } catch (error) {
+    if (isFileSystemError(error, "ENOENT")) {
+      throw new Error("parent directory does not exist");
+    }
+    throw error;
+  }
+
+  const parentRelative = path.relative(root, realParent);
+  if (isOutsideRoot(parentRelative)) {
+    throw new Error("path resolves outside the workspace");
+  }
+
+  return {
+    root,
+    target: path.join(realParent, path.basename(target)),
+    existed: false,
+  };
+}
+
 function isOutsideRoot(relativePath: string): boolean {
   return relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath);
+}
+
+function isFileSystemError(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
 }
 
 // 判断 unknown 是否为普通对象，供工具参数解析复用。

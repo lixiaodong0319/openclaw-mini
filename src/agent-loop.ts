@@ -1,4 +1,4 @@
-import { executeTool, type ToolContext } from "./tools.js";
+import { executeTool, requiresToolConfirmation, type ToolContext } from "./tools.js";
 
 export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.`;
 
@@ -15,8 +15,20 @@ export interface ToolExecutionResult {
   isError: boolean;
 }
 
+export interface ToolConfirmationRequest {
+  toolCallId: string;
+  name: string;
+  input: unknown;
+}
+
+export type ToolConfirmationHandler = (request: ToolConfirmationRequest) => boolean | Promise<boolean>;
+export type ToolExecutor = (name: string, input: unknown, context: ToolContext) => Promise<string>;
+
 export type AgentEvent =
   | { type: "text_delta"; text: string }
+  | { type: "tool_pending"; toolCallId: string; name: string; input: unknown }
+  | { type: "tool_approved"; toolCallId: string; name: string }
+  | { type: "tool_denied"; toolCallId: string; name: string }
   | { type: "tool_start"; toolCallId: string; name: string }
   | { type: "tool_end"; toolCallId: string; name: string; isError: boolean };
 
@@ -47,6 +59,7 @@ export interface AgentLoopOptions {
   toolContext: ToolContext;
   systemPrompt?: string;
   maxIterations?: number;
+  toolExecutor?: ToolExecutor;
 }
 
 export interface TurnResult {
@@ -61,15 +74,21 @@ export class AgentLoop {
   private readonly toolContext: ToolContext;
   private readonly systemPrompt: string;
   private readonly maxIterations: number;
+  private readonly toolExecutor: ToolExecutor;
 
   constructor(options: AgentLoopOptions) {
     this.provider = options.provider;
     this.toolContext = options.toolContext;
     this.systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.maxIterations = options.maxIterations ?? 8;
+    this.toolExecutor = options.toolExecutor ?? executeTool;
   }
 
-  async runTurn(userText: string, onEvent?: AgentEventHandler): Promise<TurnResult> {
+  async runTurn(
+    userText: string,
+    onEvent?: AgentEventHandler,
+    confirmTool?: ToolConfirmationHandler,
+  ): Promise<TurnResult> {
     await this.provider.addUserText(userText);
 
     for (let iteration = 0; iteration < this.maxIterations; iteration += 1) {
@@ -83,8 +102,48 @@ export class AgentLoop {
         return { text: turn.text, stopReason: turn.stopReason };
       }
 
+      // 确认必须串行进行，避免 CLI 同时出现多个 readline 提示。
+      // 完成确认后，允许执行的工具仍然通过 Promise.all 并行运行。
+      const decisions: Array<{ call: ToolCallRequest; approved: boolean }> = [];
+      for (const call of turn.calls) {
+        if (!requiresToolConfirmation(call.name)) {
+          decisions.push({ call, approved: true });
+          continue;
+        }
+
+        const request: ToolConfirmationRequest = {
+          toolCallId: call.id,
+          name: call.name,
+          input: call.input,
+        };
+        onEvent?.({ type: "tool_pending", ...request });
+
+        let approved = false;
+        try {
+          approved = confirmTool ? await confirmTool(request) : false;
+        } catch {
+          // 确认回调失败时按拒绝处理；安全默认值不能是继续执行。
+          approved = false;
+        }
+
+        onEvent?.({
+          type: approved ? "tool_approved" : "tool_denied",
+          toolCallId: call.id,
+          name: call.name,
+        });
+        decisions.push({ call, approved });
+      }
+
       const results = await Promise.all(
-        turn.calls.map(async (call): Promise<ToolExecutionResult> => {
+        decisions.map(async ({ call, approved }): Promise<ToolExecutionResult> => {
+          if (!approved) {
+            return {
+              toolCallId: call.id,
+              output: `Tool execution denied by user: ${call.name}`,
+              isError: true,
+            };
+          }
+
           onEvent?.({ type: "tool_start", toolCallId: call.id, name: call.name });
           let result: ToolExecutionResult;
           try {
@@ -93,7 +152,7 @@ export class AgentLoop {
             }
             result = {
               toolCallId: call.id,
-              output: await executeTool(call.name, call.input, this.toolContext),
+              output: await this.toolExecutor(call.name, call.input, this.toolContext),
               isError: false,
             };
           } catch (error) {

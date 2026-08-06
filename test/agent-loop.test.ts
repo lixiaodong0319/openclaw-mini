@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { AgentLoop, type AgentEvent } from "../src/agent-loop.js";
+import { AgentLoop, type AgentEvent, type ToolExecutor } from "../src/agent-loop.js";
 import { AnthropicProvider, type MessageProvider } from "../src/provider.js";
 import { FakeProvider, message } from "./fake-provider.js";
 
@@ -21,6 +21,7 @@ function createLoop(
   options: {
     onMessage?: (message: Anthropic.MessageParam) => Promise<void>;
     maxIterations?: number;
+    toolExecutor?: ToolExecutor;
   } = {},
 ): AgentLoop {
   return new AgentLoop({
@@ -32,6 +33,7 @@ function createLoop(
     }),
     toolContext: { workspaceRoot },
     maxIterations: options.maxIterations,
+    toolExecutor: options.toolExecutor,
   });
 }
 
@@ -155,6 +157,133 @@ describe("AgentLoop", () => {
       toolCallId: "toolu_1",
       name: "calculator",
       isError: true,
+    });
+  });
+
+  it("executes safe tools without asking for confirmation", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_1", "calculator", { operation: "add", a: 1, b: 2 })], "tool_use"),
+      message([textBlock("3")], "end_turn"),
+    ]);
+    const loop = createLoop(provider, [], workspaceRoot);
+    const confirmTool = vi.fn(async () => false);
+
+    await loop.runTurn("1+2", undefined, confirmTool);
+
+    expect(confirmTool).not.toHaveBeenCalled();
+  });
+
+  it("executes a protected tool after the user approves it", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_1", "write_text_file", { path: "note.txt", content: "hello" })], "tool_use"),
+      message([textBlock("saved")], "end_turn"),
+    ]);
+    const messages: Anthropic.MessageParam[] = [];
+    const loop = createLoop(provider, messages, workspaceRoot);
+    const events: AgentEvent[] = [];
+
+    await loop.runTurn("save it", (event) => events.push(event), async () => true);
+
+    await expect(fs.readFile(path.join(workspaceRoot, "note.txt"), "utf8")).resolves.toBe("hello");
+    expect(messages[2]).toEqual({
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_1",
+        content: [{
+          type: "text",
+          text: JSON.stringify({ path: "note.txt", bytes: 5, created: true }, null, 2),
+        }],
+      }],
+    });
+    expect(events).toEqual(expect.arrayContaining([
+      {
+        type: "tool_pending",
+        toolCallId: "toolu_1",
+        name: "write_text_file",
+        input: { path: "note.txt", content: "hello" },
+      },
+      { type: "tool_approved", toolCallId: "toolu_1", name: "write_text_file" },
+      { type: "tool_start", toolCallId: "toolu_1", name: "write_text_file" },
+      { type: "tool_end", toolCallId: "toolu_1", name: "write_text_file", isError: false },
+    ]));
+  });
+
+  it("does not execute a protected tool after the user denies it", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_1", "write_text_file", { path: "note.txt", content: "hello" })], "tool_use"),
+      message([textBlock("cancelled")], "end_turn"),
+    ]);
+    const messages: Anthropic.MessageParam[] = [];
+    const toolExecutor = vi.fn<ToolExecutor>(async () => "written");
+    const loop = createLoop(provider, messages, workspaceRoot, { toolExecutor });
+    const events: AgentEvent[] = [];
+
+    await loop.runTurn("save it", (event) => events.push(event), async () => false);
+
+    expect(toolExecutor).not.toHaveBeenCalled();
+    expect(messages[2]).toEqual({
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_1",
+        content: [{ type: "text", text: "Tool execution denied by user: write_text_file" }],
+        is_error: true,
+      }],
+    });
+    expect(events).toEqual([
+      {
+        type: "tool_pending",
+        toolCallId: "toolu_1",
+        name: "write_text_file",
+        input: { path: "note.txt", content: "hello" },
+      },
+      { type: "tool_denied", toolCallId: "toolu_1", name: "write_text_file" },
+      { type: "text_delta", text: "cancelled" },
+    ]);
+  });
+
+  it("denies protected tools when no confirmation handler is available", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_1", "write_text_file", { path: "note.txt", content: "hello" })], "tool_use"),
+      message([textBlock("cancelled")], "end_turn"),
+    ]);
+    const messages: Anthropic.MessageParam[] = [];
+    const toolExecutor = vi.fn<ToolExecutor>(async () => "written");
+    const loop = createLoop(provider, messages, workspaceRoot, { toolExecutor });
+
+    await loop.runTurn("save it");
+
+    expect(toolExecutor).not.toHaveBeenCalled();
+    expect(messages[2]).toEqual({
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_1",
+        content: [{ type: "text", text: "Tool execution denied by user: write_text_file" }],
+        is_error: true,
+      }],
+    });
+  });
+
+  it("denies protected tools when the confirmation handler fails", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_1", "write_text_file", { path: "note.txt", content: "hello" })], "tool_use"),
+      message([textBlock("cancelled")], "end_turn"),
+    ]);
+    const toolExecutor = vi.fn<ToolExecutor>(async () => "written");
+    const loop = createLoop(provider, [], workspaceRoot, { toolExecutor });
+    const events: AgentEvent[] = [];
+
+    await loop.runTurn("save it", (event) => events.push(event), async () => {
+      throw new Error("confirmation unavailable");
+    });
+
+    expect(toolExecutor).not.toHaveBeenCalled();
+    expect(events).toContainEqual({
+      type: "tool_denied",
+      toolCallId: "toolu_1",
+      name: "write_text_file",
     });
   });
 

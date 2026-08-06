@@ -134,6 +134,41 @@ describe("OpenAIProvider adapter", () => {
     });
   });
 
+  it("adapts denied tool calls to structured function outputs", async () => {
+    const client = new FakeOpenAIProvider([
+      openAIResponse([functionCall("call_1", "write_text_file", { path: "note.txt", content: "hello" })]),
+      openAIResponse([outputMessage("cancelled")]),
+    ]);
+    const input: OpenAIInputItem[] = [];
+    const loop = createLoop(client, input, workspaceRoot);
+
+    await loop.runTurn("save it", undefined, async () => false);
+
+    expect(input).toContainEqual({
+      type: "function_call_output",
+      call_id: "call_1",
+      output: JSON.stringify({ error: "Tool execution denied by user: write_text_file" }),
+    });
+  });
+
+  it("executes approved write calls through the shared loop", async () => {
+    const client = new FakeOpenAIProvider([
+      openAIResponse([functionCall("call_1", "write_text_file", { path: "note.txt", content: "hello" })]),
+      openAIResponse([outputMessage("saved")]),
+    ]);
+    const input: OpenAIInputItem[] = [];
+    const loop = createLoop(client, input, workspaceRoot);
+
+    await loop.runTurn("save it", undefined, async () => true);
+
+    await expect(fs.readFile(path.join(workspaceRoot, "note.txt"), "utf8")).resolves.toBe("hello");
+    expect(input).toContainEqual({
+      type: "function_call_output",
+      call_id: "call_1",
+      output: JSON.stringify({ path: "note.txt", bytes: 5, created: true }, null, 2),
+    });
+  });
+
   it("shares the same iteration limit behavior", async () => {
     const client = new FakeOpenAIProvider([
       openAIResponse([functionCall("call_1", "calculator", { operation: "add", a: 1, b: 1 })]),

@@ -5,14 +5,16 @@
 ## 功能
 
 - 本地命令行 REPL 对话
-- 模型文本流式输出，显示工具执行中、完成和失败状态
+- 模型文本流式输出，显示工具确认、执行中、完成和失败状态
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
-- 三个最小工具：
+- 五个最小工具：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
+  - `write_text_file`：确认后创建或覆盖 `workspace/` 内的 UTF-8 文本文件
+  - `edit_text_file`：确认后精确替换现有文本文件中的唯一内容块
 - JSONL 会话持久化，支持重启后继续同一 session
 - Fake Provider 测试，不依赖真实 API Key 或网络
 - TypeScript 严格类型检查
@@ -23,10 +25,10 @@
 - OpenClaw Gateway / daemon
 - Web UI
 - Slack、Discord、Telegram 等消息渠道
-- 文件写入或编辑工具
+- 文件删除或重命名工具
 - Shell 执行
 - 浏览器、网络搜索、MCP、多 Agent、记忆系统
-- 流式输出、上下文压缩、模型 fallback、成本路由
+- 上下文压缩、模型 fallback、成本路由
 
 ## 目录结构
 
@@ -123,6 +125,20 @@ pnpm dev -- --session smoke
 workspace 中包含 note.txt。
 ```
 
+`calculator`、`list_directory` 和 `read_text_file` 是无副作用工具，会自动执行。`write_text_file` 和 `edit_text_file` 是有副作用工具，每次修改前都会显示调用参数并询问：
+
+```text
+[工具] write_text_file 等待确认
+参数:
+{
+  "path": "note.txt",
+  "content": "hello"
+}
+允许执行 write_text_file？[y/N]
+```
+
+只有输入 `y` 或 `yes` 才会允许；直接回车、其他输入、确认回调缺失或异常都会按拒绝处理。
+
 ## 使用示例
 
 计算：
@@ -144,9 +160,11 @@ pnpm dev -- --session demo
 ```text
 > 查看 workspace 里有哪些文件
 > 读取 note.txt 并总结内容
+> 创建 hello.txt，内容是 Hello World
+> 把 config.txt 中的 port=3000 改成 port=8080
 ```
 
-`list_directory` 和 `read_text_file` 只能访问 `workspace/`。访问 `../`、绝对路径或通过符号链接逃逸到 workspace 外都会被拒绝。目录浏览每次只返回一层，最多返回 200 项。
+`list_directory`、`read_text_file`、`write_text_file` 和 `edit_text_file` 只能访问 `workspace/`。访问 `../`、绝对路径或通过符号链接逃逸到 workspace 外都会被拒绝。目录浏览每次只返回一层，最多返回 200 项；文本读写上限为 1 MiB。写入新文件时，父目录必须已存在。精确编辑只有在 `old_text` 唯一匹配时才会执行。
 
 OpenAI 和 Anthropic 使用独立的会话文件；相同 `--session` 名称不会混用两种 API 的历史格式。
 
@@ -162,7 +180,9 @@ pnpm test         运行测试
 
 ## 安全边界
 
-当前版本只暴露两个无副作用工具。模型无法获得写文件、执行 shell、访问浏览器或访问 workspace 外文件的工具能力。
+当前版本暴露三个无副作用工具和两个需确认的文本修改工具。模型无法执行 shell、访问浏览器或读写 workspace 外文件。
+
+工具权限采用安全默认值：已登记的纯计算和只读工具自动放行，所有未登记工具都必须经过用户确认。拒绝后不会调用工具实现，而是把拒绝结果回填给模型，让模型继续回复。
 
 文件读取安全由代码强制执行：
 
@@ -187,6 +207,7 @@ pnpm run build
 - Anthropic 与 OpenAI 文本增量转发
 - OpenAI Responses API SSE 分块解析
 - 工具开始、完成和失败事件
+- 安全工具自动放行，受保护工具允许、拒绝和缺省拒绝
 - 普通模型文本回复
 - 单工具调用
 - 多工具并行调用
@@ -195,14 +216,14 @@ pnpm run build
 - OpenAI reasoning item 回放和 `function_call_output`
 - refusal 和迭代上限
 - workspace 文件读取边界
+- workspace 文件创建、覆盖、大小上限和写入边界
+- workspace 文件唯一内容块替换及零匹配、多匹配保护
 - JSONL 会话保存与加载
 
 ## 当前定位
 
 这个项目适合作为最小 Agent Loop 学习样例。后续如果要继续扩展，建议按顺序增加：
 
-1. 更完整的工具确认机制
-2. 文件编辑工具
-3. 上下文压缩或摘要
-4. 多模型或 fallback
-5. Web UI
+1. 上下文压缩或摘要
+2. 多模型或 fallback
+3. Web UI

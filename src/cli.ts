@@ -1,9 +1,13 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { createInterface } from "node:readline/promises";
+import { createInterface, type Interface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { AgentLoop, type AgentEvent } from "./agent-loop.js";
+import {
+  AgentLoop,
+  type AgentEvent,
+  type ToolConfirmationRequest,
+} from "./agent-loop.js";
 import {
   AnthropicProvider,
   OpenAIAPIError,
@@ -56,7 +60,11 @@ async function main(): Promise<void> {
 
       const renderer = createTurnRenderer();
       try {
-        await agent.runTurn(line, renderer.handle);
+        await agent.runTurn(
+          line,
+          renderer.handle,
+          (request) => confirmToolCall(rl, request),
+        );
         renderer.finish();
       } catch (error) {
         renderer.finish();
@@ -91,7 +99,21 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
         writeStatus(`${event.name} 执行中...`);
         return;
       }
-      writeStatus(`${event.name} ${event.isError ? "失败" : "完成"}`);
+      if (event.type === "tool_pending") {
+        writeStatus(`${event.name} 等待确认`);
+        return;
+      }
+      if (event.type === "tool_approved") {
+        writeStatus(`${event.name} 已允许`);
+        return;
+      }
+      if (event.type === "tool_denied") {
+        writeStatus(`${event.name} 已拒绝`);
+        return;
+      }
+      if (event.type === "tool_end") {
+        writeStatus(`${event.name} ${event.isError ? "失败" : "完成"}`);
+      }
     },
     finish: () => {
       if (finished) return;
@@ -100,6 +122,30 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
       finished = true;
     },
   };
+}
+
+async function confirmToolCall(
+  rl: Interface,
+  request: ToolConfirmationRequest,
+): Promise<boolean> {
+  output.write(`参数:\n${formatToolInput(request.input)}\n`);
+  const answer = (await rl.question(`允许执行 ${request.name}？[y/N] `)).trim().toLowerCase();
+  return answer === "y" || answer === "yes";
+}
+
+function formatToolInput(input: unknown): string {
+  const maxLength = 2_000;
+  let text: string;
+  try {
+    text = JSON.stringify(input, null, 2) ?? String(input);
+  } catch {
+    text = String(input);
+  }
+
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength)}\n...（已截断）`;
 }
 
 async function createAgent(
