@@ -9,12 +9,13 @@
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
-- 五个最小工具：
+- 六个最小工具：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
   - `write_text_file`：确认后创建或覆盖 `workspace/` 内的 UTF-8 文本文件
   - `edit_text_file`：确认后精确替换现有文本文件中的唯一内容块
+  - `run_command`：确认后从 `workspace/` 启动 Shell 命令，用于构建、测试和代码检查
 - JSONL 会话持久化，支持重启后继续同一 session
 - 长会话自动摘要压缩，保留最近完整轮次和工具调用链
 - Fake Provider 测试，不依赖真实 API Key 或网络
@@ -27,7 +28,6 @@
 - Web UI
 - Slack、Discord、Telegram 等消息渠道
 - 文件删除或重命名工具
-- Shell 执行
 - 浏览器、网络搜索、MCP、多 Agent、记忆系统
 - 模型 fallback、成本路由
 
@@ -107,6 +107,14 @@ export OPENCLAW_COMPACT_SUMMARY_TOKENS="2000"
 
 token 数是根据原生历史 JSON 的 UTF-8 大小估算，不是模型 tokenizer 的精确计数。压缩切分点只选在真实用户消息之前，不会拆开工具调用和工具结果。
 
+### Shell 工具配置
+
+Shell 命令默认最多运行 30 秒，可通过环境变量缩短或延长，最大不能超过 120 秒：
+
+```bash
+export OPENCLAW_COMMAND_TIMEOUT_MS="30000"
+```
+
 ### Anthropic SDK profile
 
 如果本机配置了 Anthropic SDK 可识别的本地 profile，也可以使用对应凭据。
@@ -146,7 +154,7 @@ workspace 中包含 note.txt。
 [会话] 上下文压缩完成（32840 → 6210 tokens）
 ```
 
-`calculator`、`list_directory` 和 `read_text_file` 是无副作用工具，会自动执行。`write_text_file` 和 `edit_text_file` 是有副作用工具，每次修改前都会显示调用参数并询问：
+`calculator`、`list_directory` 和 `read_text_file` 是无副作用工具，会自动执行。`write_text_file`、`edit_text_file` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
 
 ```text
 [工具] write_text_file 等待确认
@@ -183,9 +191,12 @@ pnpm dev -- --session demo
 > 读取 note.txt 并总结内容
 > 创建 hello.txt，内容是 Hello World
 > 把 config.txt 中的 port=3000 改成 port=8080
+> 运行 pnpm test 并分析失败原因
 ```
 
 `list_directory`、`read_text_file`、`write_text_file` 和 `edit_text_file` 只能访问 `workspace/`。访问 `../`、绝对路径或通过符号链接逃逸到 workspace 外都会被拒绝。目录浏览每次只返回一层，最多返回 200 项；文本读写上限为 1 MiB。写入新文件时，父目录必须已存在。精确编辑只有在 `old_text` 唯一匹配时才会执行。
+
+`run_command` 固定从 `workspace/` 启动，但这只是初始工作目录，并不是文件系统沙箱：Shell 命令仍可能通过绝对路径或 `..` 访问 workspace 外部。因此该工具不会自动放行，每次调用都必须人工确认。子进程不接收交互式 stdin；默认超时 30 秒，最长可配置为 120 秒；stdout 和 stderr 各最多返回 64 KiB，超出部分会标记为截断。常见的 Key、Token、Password、Cookie、Session 等敏感环境变量不会传给子进程。
 
 OpenAI 和 Anthropic 使用独立的会话文件；相同 `--session` 名称不会混用两种 API 的历史格式。
 
@@ -201,7 +212,7 @@ pnpm test         运行测试
 
 ## 安全边界
 
-当前版本暴露三个无副作用工具和两个需确认的文本修改工具。模型无法执行 shell、访问浏览器或读写 workspace 外文件。
+当前版本暴露三个自动放行工具，以及两个文本修改工具和一个每次都需确认的 Shell 工具。模型无法访问浏览器；文件工具无法读写 workspace 外文件。
 
 工具权限采用安全默认值：已登记的纯计算和只读工具自动放行，所有未登记工具都必须经过用户确认。拒绝后不会调用工具实现，而是把拒绝结果回填给模型，让模型继续回复。
 
@@ -214,6 +225,8 @@ pnpm test         运行测试
 - 单文件最大读取 1 MiB
 
 计算器不使用 `eval`，只接受结构化参数和固定四则运算。
+
+Shell 工具只把确认过的命令交给系统 Shell。它会清理常见凭据类环境变量并限制运行时间和返回内容大小，但不提供容器或操作系统级隔离。执行命令前应按终端显示的完整参数判断是否允许。
 
 ## 测试
 
@@ -239,6 +252,7 @@ pnpm run build
 - workspace 文件读取边界
 - workspace 文件创建、覆盖、大小上限和写入边界
 - workspace 文件唯一内容块替换及零匹配、多匹配保护
+- Shell 命令的工作目录、退出码、超时、输出截断和敏感环境变量清理
 - Anthropic 和 OpenAI 历史摘要压缩与最近工具链保留
 - 压缩后 JSONL 历史原子替换
 - JSONL 会话保存与加载
@@ -247,5 +261,4 @@ pnpm run build
 
 这个项目适合作为最小 Agent Loop 学习样例。后续如果要继续扩展，建议按顺序增加：
 
-1. 多模型或 fallback
-2. Web UI
+1. Web UI

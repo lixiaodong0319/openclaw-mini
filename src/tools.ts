@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -19,6 +20,8 @@ export interface OpenAIToolDefinition {
 // 如果后续加入权限确认、审计日志、用户 ID，也应该从这里传入。
 export interface ToolContext {
   workspaceRoot: string;
+  // 命令超时由宿主配置，不接受模型参数，避免模型自行关闭或无限延长超时。
+  commandTimeoutMs?: number;
 }
 
 // read_text_file 的模型输入结构。
@@ -56,12 +59,28 @@ interface CalculatorInput {
   b: number;
 }
 
+// run_command 故意只接收命令文本。cwd、超时和环境变量都由可信宿主决定。
+interface RunCommandInput {
+  command: string;
+}
+
 // 单次读取 1 MiB 是刻意的 MVP 限制。
 // 它既能防止误读大文件撑爆上下文，也让工具错误更容易解释和测试。
 const MAX_FILE_BYTES = 1024 * 1024;
 
 // 限制单次目录列表的规模，防止大型目录一次性占满模型上下文。
 const MAX_DIRECTORY_ENTRIES = 200;
+
+// Shell 命令默认最长运行 30 秒，宿主可调整，但不允许超过 2 分钟。
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const MAX_COMMAND_TIMEOUT_MS = 120_000;
+
+// stdout/stderr 分别最多回填 64 KiB，超出部分会继续从 pipe 排空但不保存到内存。
+const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
+
+// 子进程继承 PATH 等必要环境，但不继承常见凭据类变量。
+// 这不是 Shell 沙箱，而是防止 `env` 等普通命令直接暴露 API Key 的额外防线。
+const SENSITIVE_ENVIRONMENT_NAME = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|AUTHORIZATION|COOKIE|SESSION|JWT)(?:_|$)/i;
 
 // 当前三个工具都是只读或纯计算能力，可以直接执行。
 // 未登记的新工具默认需要用户确认，避免未来加入写文件、Shell 等能力时意外绕过审批。
@@ -170,6 +189,22 @@ export const toolDefinitions: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "run_command",
+    description: "Call this to run a shell command for building, testing, or inspecting the workspace. The command starts in the workspace but is not sandboxed, so every call requires explicit user approval. Do not access paths outside the workspace.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        command: {
+          type: "string",
+          description: "The exact shell command to execute from the workspace directory.",
+        },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 // OpenAI Responses API 使用 parameters 字段描述函数参数。
@@ -201,6 +236,8 @@ export async function executeTool(
       return writeTextFile(parseWriteTextFileInput(input), context);
     case "edit_text_file":
       return editTextFile(parseEditTextFileInput(input), context);
+    case "run_command":
+      return runCommand(parseRunCommandInput(input), context);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -276,6 +313,20 @@ function parseCalculatorInput(input: unknown): CalculatorInput {
   return { operation, a, b };
 }
 
+function parseRunCommandInput(input: unknown): RunCommandInput {
+  if (!isRecord(input) || typeof input.command !== "string") {
+    throw new Error("run_command requires a string command");
+  }
+
+  if (input.command.trim().length === 0) {
+    throw new Error("run_command command must not be empty");
+  }
+  if (Buffer.byteLength(input.command, "utf8") > 8 * 1024) {
+    throw new Error("run_command command is too long; maximum is 8192 bytes");
+  }
+  return { command: input.command };
+}
+
 // 计算器只做固定分支运算，不支持表达式字符串。
 // 这是最小实现里重要的安全边界：不引入 eval、Function、shell 或任意脚本执行能力。
 function runCalculator(input: CalculatorInput): string {
@@ -291,6 +342,134 @@ function runCalculator(input: CalculatorInput): string {
         throw new Error("division by zero is not allowed");
       }
       return String(input.a / input.b);
+  }
+}
+
+interface LimitedCommandOutput {
+  chunks: Buffer[];
+  bytes: number;
+  truncated: boolean;
+}
+
+async function runCommand(input: RunCommandInput, context: ToolContext): Promise<string> {
+  const cwd = await fs.realpath(context.workspaceRoot);
+  const timeoutMs = resolveCommandTimeout(context.commandTimeoutMs);
+  const stdout: LimitedCommandOutput = { chunks: [], bytes: 0, truncated: false };
+  const stderr: LimitedCommandOutput = { chunks: [], bytes: 0, truncated: false };
+
+  // shell: true 让命令在 Windows 使用 ComSpec，在 POSIX 使用 /bin/sh，
+  // 从而支持 pnpm scripts、管道和重定向。stdin 固定为 ignore，防止交互命令占用 CLI 输入。
+  const child = spawn(input.command, {
+    cwd,
+    shell: true,
+    env: createCommandEnvironment(),
+    stdio: ["ignore", "pipe", "pipe"],
+    // POSIX 下创建独立进程组，超时时可以连同 Shell 的子进程一起终止。
+    detached: process.platform !== "win32",
+    windowsHide: true,
+  });
+
+  child.stdout.on("data", (chunk: Buffer) => appendLimitedOutput(stdout, chunk));
+  child.stderr.on("data", (chunk: Buffer) => appendLimitedOutput(stderr, chunk));
+
+  return new Promise<string>((resolve, reject) => {
+    let settled = false;
+    let timedOut = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      terminateCommandProcess(child, false);
+      // 给进程 1 秒清理时间；仍未退出则强制终止。
+      forceKillTimer = setTimeout(() => terminateCommandProcess(child, true), 1_000);
+    }, timeoutMs);
+
+    const clearTimers = (): void => {
+      clearTimeout(timeoutTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+    };
+
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      reject(error);
+    });
+
+    child.once("close", (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      resolve(JSON.stringify({
+        command: input.command,
+        cwd: ".",
+        exit_code: exitCode,
+        signal,
+        timed_out: timedOut,
+        stdout: Buffer.concat(stdout.chunks).toString("utf8"),
+        stderr: Buffer.concat(stderr.chunks).toString("utf8"),
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+      }, null, 2));
+    });
+  });
+}
+
+function resolveCommandTimeout(configuredTimeoutMs: number | undefined): number {
+  const timeoutMs = configuredTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_COMMAND_TIMEOUT_MS) {
+    throw new Error(`command timeout must be an integer between 1 and ${MAX_COMMAND_TIMEOUT_MS} milliseconds`);
+  }
+  return timeoutMs;
+}
+
+function terminateCommandProcess(child: ChildProcess, force: boolean): void {
+  if (child.pid === undefined) return;
+
+  if (process.platform === "win32") {
+    // Node 在 Windows 上只会终止直接子进程，taskkill /T 用于清理 cmd.exe 启动的整棵子进程树。
+    // 第一次不加 /F，给命令正常退出的机会；一秒后仍未退出才强制终止。
+    const arguments_ = ["/pid", String(child.pid), "/t"];
+    if (force) arguments_.push("/f");
+    const killer = spawn("taskkill", arguments_, {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.once("error", () => child.kill(force ? "SIGKILL" : "SIGTERM"));
+    return;
+  }
+
+  try {
+    // detached: true 使 child.pid 成为新进程组 id，负 pid 会将信号发给整个命令树。
+    process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM");
+  } catch {
+    // 进程可能恰好已退出；直接 kill 作为进程组不存在时的 fallback。
+    child.kill(force ? "SIGKILL" : "SIGTERM");
+  }
+}
+
+function createCommandEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !SENSITIVE_ENVIRONMENT_NAME.test(name)) {
+      environment[name] = value;
+    }
+  }
+  return environment;
+}
+
+function appendLimitedOutput(output: LimitedCommandOutput, chunk: Buffer): void {
+  const remaining = MAX_COMMAND_OUTPUT_BYTES - output.bytes;
+  if (remaining <= 0) {
+    output.truncated = true;
+    return;
+  }
+
+  const selected = chunk.subarray(0, remaining);
+  output.chunks.push(selected);
+  output.bytes += selected.length;
+  if (selected.length < chunk.length) {
+    output.truncated = true;
   }
 }
 

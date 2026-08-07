@@ -179,6 +179,10 @@ async function createAgent(
   workspaceRoot: string,
 ): Promise<{ agent: AgentLoop; model: string }> {
   const compaction = getContextCompactionOptions();
+  const toolContext = {
+    workspaceRoot,
+    commandTimeoutMs: getCommandTimeoutMs(),
+  };
   if (providerName === "openai") {
     // OpenAI Responses API 的历史包含 message、reasoning、function_call 和 function_call_output item。
     // 使用独立 namespace，防止和 Anthropic Messages API 的 JSONL 结构混在同一个 session 文件里。
@@ -196,7 +200,7 @@ async function createAgent(
           onHistoryReplace: (items) => store.replace(items),
           compaction,
         }),
-        toolContext: { workspaceRoot },
+        toolContext,
       }),
     };
   }
@@ -216,9 +220,17 @@ async function createAgent(
         onHistoryReplace: (replacement) => store.replace(replacement),
         compaction,
       }),
-      toolContext: { workspaceRoot },
+      toolContext,
     }),
   };
+}
+
+function getCommandTimeoutMs(): number {
+  const timeoutMs = readPositiveIntegerEnvironment("OPENCLAW_COMMAND_TIMEOUT_MS", 30_000);
+  if (timeoutMs > 120_000) {
+    throw new Error("OPENCLAW_COMMAND_TIMEOUT_MS must not exceed 120000");
+  }
+  return timeoutMs;
 }
 
 function getContextCompactionOptions() {

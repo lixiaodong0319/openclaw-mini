@@ -240,6 +240,117 @@ describe("tools", () => {
     await expect(executeTool("calculator", { operation: "divide", a: 1, b: 0 }, { workspaceRoot })).rejects.toThrow("division by zero");
   });
 
+  it("runs shell commands from the workspace and captures stdout", async () => {
+    const output = JSON.parse(await executeTool(
+      "run_command",
+      { command: "echo 4" },
+      { workspaceRoot },
+    )) as {
+      command: string;
+      cwd: string;
+      exit_code: number | null;
+      signal: string | null;
+      timed_out: boolean;
+      stdout: string;
+      stderr: string;
+      stdout_truncated: boolean;
+      stderr_truncated: boolean;
+    };
+
+    expect(output).toEqual({
+      command: "echo 4",
+      cwd: ".",
+      exit_code: 0,
+      signal: null,
+      timed_out: false,
+      stdout: `4${os.EOL}`,
+      stderr: "",
+      stdout_truncated: false,
+      stderr_truncated: false,
+    });
+  });
+
+  it("starts shell commands in the configured workspace", async () => {
+    const output = JSON.parse(await executeTool(
+      "run_command",
+      { command: process.platform === "win32" ? "cd" : "pwd" },
+      { workspaceRoot },
+    )) as { stdout: string };
+
+    expect(output.stdout.trim()).toBe(await fs.realpath(workspaceRoot));
+  });
+
+  it("returns non-zero exit codes and stderr without throwing", async () => {
+    const output = JSON.parse(await executeTool(
+      "run_command",
+      { command: process.platform === "win32" ? "echo 123 1>&2 & exit /b 7" : "printf 123 >&2; exit 7" },
+      { workspaceRoot },
+    )) as { exit_code: number | null; stderr: string; timed_out: boolean };
+
+    expect(output).toMatchObject({
+      exit_code: 7,
+      stderr: "123",
+      timed_out: false,
+    });
+  });
+
+  it("terminates shell commands after the configured timeout", async () => {
+    const output = JSON.parse(await executeTool(
+      "run_command",
+      { command: process.platform === "win32" ? "ping -n 6 127.0.0.1 >nul" : "sleep 5" },
+      { workspaceRoot, commandTimeoutMs: 50 },
+    )) as { exit_code: number | null; signal: string | null; timed_out: boolean };
+
+    expect(output.timed_out).toBe(true);
+    expect(output.exit_code === null || output.exit_code !== 0).toBe(true);
+  });
+
+  it("truncates command output after 64 KiB", async () => {
+    const output = JSON.parse(await executeTool(
+      "run_command",
+      {
+        command: process.platform === "win32"
+          ? 'powershell -NoProfile -Command "[Console]::Out.Write(\'1\' * 70000)"'
+          : "awk 'BEGIN { for (i = 0; i < 70000; i++) printf \"1\" }'",
+      },
+      { workspaceRoot },
+    )) as { stdout: string; stdout_truncated: boolean };
+
+    expect(Buffer.byteLength(output.stdout, "utf8")).toBe(64 * 1024);
+    expect(output.stdout_truncated).toBe(true);
+  });
+
+  it("does not pass API keys to command processes", async () => {
+    const previousApiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-secret-that-must-not-leak";
+    try {
+      const output = JSON.parse(await executeTool(
+        "run_command",
+        {
+          command: process.platform === "win32"
+            ? "if defined OPENAI_API_KEY (echo set) else (echo 0)"
+            : "if [ -n \"${OPENAI_API_KEY:-}\" ]; then printf set; else printf 0; fi",
+        },
+        { workspaceRoot },
+      )) as { stdout: string };
+
+      expect(output.stdout.trim()).toBe("0");
+    } finally {
+      if (previousApiKey === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = previousApiKey;
+      }
+    }
+  });
+
+  it("rejects empty and oversized shell commands", async () => {
+    await expect(executeTool("run_command", { command: "   " }, { workspaceRoot }))
+      .rejects.toThrow("must not be empty");
+    await expect(executeTool("run_command", { command: "x".repeat(8193) }, { workspaceRoot }))
+      .rejects.toThrow("maximum is 8192 bytes");
+  });
+
   it("rejects unknown tools", async () => {
     await expect(executeTool("shell", {}, { workspaceRoot })).rejects.toThrow("Unknown tool");
   });
@@ -250,6 +361,7 @@ describe("tools", () => {
     expect(requiresToolConfirmation("read_text_file")).toBe(false);
     expect(requiresToolConfirmation("write_text_file")).toBe(true);
     expect(requiresToolConfirmation("edit_text_file")).toBe(true);
+    expect(requiresToolConfirmation("run_command")).toBe(true);
     expect(requiresToolConfirmation("shell")).toBe(true);
   });
 });
