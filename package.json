@@ -9,8 +9,10 @@
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
+    "web": "tsx src/web.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/cli.js",
+    "start:web": "node dist/src/web.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },

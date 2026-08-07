@@ -5,6 +5,7 @@
 ## 功能
 
 - 本地命令行 REPL 对话
+- 本地 Web 对话，可选择或新建 Session
 - 模型文本流式输出，显示工具确认、执行中、完成和失败状态
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
@@ -25,7 +26,6 @@
 
 - 官方 OpenClaw 配置兼容
 - OpenClaw Gateway / daemon
-- Web UI
 - Slack、Discord、Telegram 等消息渠道
 - 文件删除或重命名工具
 - 浏览器、网络搜索、MCP、多 Agent、记忆系统
@@ -39,8 +39,12 @@ src/
   cli.ts             本地命令行入口
   context-compaction.ts 上下文估算、压缩阈值和保留策略
   provider.ts        Anthropic 与 OpenAI Provider 适配器
+  runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
   session-store.ts   JSONL 会话存储
   tools.ts           工具定义与执行逻辑
+  web.ts             本地 Web 服务入口
+  web-server.ts      HTTP、SSE、Session 并发和工具确认接口
+  web-page.ts        无框架的单页聊天界面
 
 test/
   agent-loop.test.ts     Agent Loop 测试
@@ -49,6 +53,7 @@ test/
   fake-provider.ts       测试用 Fake Provider
   session-store.test.ts  会话存储测试
   tools.test.ts          工具边界测试
+  web-server.test.ts     Web、SSE 和浏览器确认测试
 
 workspace/            Agent 可读取的工作区
 data/                 本地会话历史，已被 .gitignore 忽略
@@ -121,6 +126,8 @@ export OPENCLAW_COMMAND_TIMEOUT_MS="30000"
 
 ## 运行
 
+### 命令行
+
 启动默认会话：
 
 ```bash
@@ -168,6 +175,31 @@ workspace 中包含 note.txt。
 
 只有输入 `y` 或 `yes` 才会允许；直接回车、其他输入、确认回调缺失或异常都会按拒绝处理。
 
+### Web UI
+
+启动本地 Web 服务：
+
+```bash
+pnpm web
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:3000
+```
+
+页面会显示当前 Provider、模型和 workspace，可以选择已有 Session 或新建 Session。模型回复通过 POST 请求的 SSE 响应流式显示；遇到受保护工具时，当前轮次会暂停，只有点击“允许”或“拒绝”后才会继续。切换 Session 会清空当前页面显示，但服务端仍会加载对应 JSONL 历史并继续上下文。
+
+监听地址和端口可以配置：
+
+```bash
+export OPENCLAW_WEB_HOST="127.0.0.1"
+export OPENCLAW_WEB_PORT="3000"
+```
+
+默认只监听本机回环地址。Web UI 没有用户账户和登录认证，不要在不可信网络中把 `OPENCLAW_WEB_HOST` 设置为 `0.0.0.0`。
+
 ## 使用示例
 
 计算：
@@ -198,14 +230,23 @@ pnpm dev -- --session demo
 
 `run_command` 固定从 `workspace/` 启动，但这只是初始工作目录，并不是文件系统沙箱：Shell 命令仍可能通过绝对路径或 `..` 访问 workspace 外部。因此该工具不会自动放行，每次调用都必须人工确认。子进程不接收交互式 stdin；默认超时 30 秒，最长可配置为 120 秒；stdout 和 stderr 各最多返回 64 KiB，超出部分会标记为截断。常见的 Key、Token、Password、Cookie、Session 等敏感环境变量不会传给子进程。
 
-OpenAI 和 Anthropic 使用独立的会话文件；相同 `--session` 名称不会混用两种 API 的历史格式。
+OpenAI 和 Anthropic 使用独立目录保存会话；相同 `--session` 名称不会混用两种 API 的历史格式：
+
+```text
+data/sessions/anthropic/default.jsonl
+data/sessions/openai/default.jsonl
+```
+
+启动 Anthropic CLI 或 Web 服务时，旧版本位于 `data/sessions/*.jsonl` 的合法会话文件会自动迁移到 `data/sessions/anthropic/`。如果新目录已经存在同名文件，旧文件会保留在原位置，不会覆盖新会话。
 
 ## 脚本
 
 ```bash
 pnpm dev          启动 TypeScript REPL
+pnpm web          启动 TypeScript Web UI
 pnpm build        编译到 dist/
 pnpm start        运行编译后的 CLI
+pnpm start:web    运行编译后的 Web UI
 pnpm typecheck    TypeScript 类型检查
 pnpm test         运行测试
 ```
@@ -227,6 +268,8 @@ pnpm test         运行测试
 计算器不使用 `eval`，只接受结构化参数和固定四则运算。
 
 Shell 工具只把确认过的命令交给系统 Shell。它会清理常见凭据类环境变量并限制运行时间和返回内容大小，但不提供容器或操作系统级隔离。执行命令前应按终端显示的完整参数判断是否允许。
+
+Web 服务默认绑定 `127.0.0.1`，JSON 写接口只接受 `application/json`。每个 Session 同时只运行一个轮次，防止并发请求打乱内存历史和 JSONL 追加顺序；浏览器断开时，仍在等待的工具确认会自动按拒绝处理。不要让 CLI 和 Web 同时使用同一个 Session，因为当前 JSONL 存储没有跨进程文件锁。
 
 ## 测试
 
@@ -253,12 +296,14 @@ pnpm run build
 - workspace 文件创建、覆盖、大小上限和写入边界
 - workspace 文件唯一内容块替换及零匹配、多匹配保护
 - Shell 命令的工作目录、退出码、超时、输出截断和敏感环境变量清理
+- Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic 和 OpenAI 历史摘要压缩与最近工具链保留
 - 压缩后 JSONL 历史原子替换
+- 旧 Anthropic 会话向独立目录的无覆盖迁移
 - JSONL 会话保存与加载
 
 ## 当前定位
 
 这个项目适合作为最小 Agent Loop 学习样例。后续如果要继续扩展，建议按顺序增加：
 
-1. Web UI
+1. 在 Web UI 中回放已有 Session 的对话历史

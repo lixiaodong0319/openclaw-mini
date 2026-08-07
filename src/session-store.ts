@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -77,6 +78,66 @@ export class SessionStore<T = Anthropic.MessageParam> {
       throw error;
     }
   }
+}
+
+// Web UI 用它填充 session 下拉框。只返回符合 SessionStore 命名规则的 JSONL 文件，
+// 临时文件、损坏命名和子目录都不会暴露给浏览器。
+export async function listSessionIds(dataRoot: string, namespace?: string): Promise<string[]> {
+  if (namespace !== undefined && !/^[A-Za-z0-9_-]+$/.test(namespace)) {
+    throw new Error("session namespace may only contain letters, numbers, underscores, and hyphens");
+  }
+  const directory = namespace
+    ? path.join(dataRoot, "sessions", namespace)
+    : path.join(dataRoot, "sessions");
+  try {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile() && /^[A-Za-z0-9_-]+\.jsonl$/.test(entry.name))
+      .map((entry) => entry.name.slice(0, -".jsonl".length))
+      .sort((left, right) => left.localeCompare(right));
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+// 早期版本把 Anthropic 会话直接写在 data/sessions/*.jsonl。
+// 新版本启动时将这些合法会话移动到 data/sessions/anthropic/，使两个 Provider 的目录结构一致。
+export async function migrateLegacyAnthropicSessions(dataRoot: string): Promise<number> {
+  const sessionsRoot = path.join(dataRoot, "sessions");
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(sessionsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return 0;
+    throw error;
+  }
+
+  const legacyFiles = entries.filter(
+    (entry) => entry.isFile() && /^[A-Za-z0-9_-]+\.jsonl$/.test(entry.name),
+  );
+  if (legacyFiles.length === 0) return 0;
+
+  const targetDirectory = path.join(sessionsRoot, "anthropic");
+  await fs.mkdir(targetDirectory, { recursive: true });
+  let migrated = 0;
+  for (const entry of legacyFiles) {
+    const source = path.join(sessionsRoot, entry.name);
+    const target = path.join(targetDirectory, entry.name);
+    try {
+      // link 会以排他方式原子创建目标且不复制内容，同名新会话绝不被旧数据覆盖。
+      // 链接成功后再删除旧路径；进程在两步之间退出只会留下两个完整的硬链接。
+      await fs.link(source, target);
+      await fs.unlink(source);
+      migrated += 1;
+    } catch (error) {
+      if (isNodeError(error) && (error.code === "EEXIST" || error.code === "ENOENT")) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  return migrated;
 }
 
 // Node 的 fs 错误会携带 code 字段。

@@ -1,0 +1,208 @@
+// 页面刻意保持为单文件原生 HTML/JS：不引入前端框架和打包器，便于直接研究
+// fetch ReadableStream 如何消费服务端的 SSE 文本增量。
+export const WEB_PAGE = String.raw`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenClaw Mini</title>
+</head>
+<body>
+  <h1>OpenClaw Mini</h1>
+  <p id="runtime">正在读取配置...</p>
+
+  <label for="session">Session：</label>
+  <select id="session"></select>
+  <button id="new-session" type="button">新建 Session</button>
+
+  <hr>
+  <main id="messages"></main>
+
+  <form id="chat-form">
+    <p><label for="message">消息：</label></p>
+    <textarea id="message" rows="5" cols="80" required></textarea>
+    <p><button id="send" type="submit">发送</button></p>
+  </form>
+
+  <script>
+    const runtimeElement = document.querySelector("#runtime");
+    const sessionElement = document.querySelector("#session");
+    const messagesElement = document.querySelector("#messages");
+    const formElement = document.querySelector("#chat-form");
+    const messageElement = document.querySelector("#message");
+    const sendElement = document.querySelector("#send");
+    const newSessionElement = document.querySelector("#new-session");
+    let assistantOutput = null;
+
+    function appendMessage(label, text) {
+      const container = document.createElement("section");
+      const heading = document.createElement("strong");
+      const content = document.createElement("pre");
+      heading.textContent = label;
+      content.textContent = text;
+      container.append(heading, content);
+      messagesElement.append(container);
+      return { container, content };
+    }
+
+    function appendAssistantText(text) {
+      if (!assistantOutput) assistantOutput = appendMessage("助手", "").content;
+      assistantOutput.textContent += text;
+    }
+
+    function addSession(sessionId) {
+      if ([...sessionElement.options].some((option) => option.value === sessionId)) return;
+      const option = document.createElement("option");
+      option.value = sessionId;
+      option.textContent = sessionId;
+      sessionElement.append(option);
+    }
+
+    async function loadPageData() {
+      const [configResponse, sessionsResponse] = await Promise.all([
+        fetch("/api/config"),
+        fetch("/api/sessions"),
+      ]);
+      if (!configResponse.ok || !sessionsResponse.ok) throw new Error("无法读取 Web 配置");
+      const config = await configResponse.json();
+      const sessions = await sessionsResponse.json();
+      runtimeElement.textContent = "Provider: " + config.provider
+        + " | Model: " + config.model
+        + " | Workspace: " + config.workspace;
+      (sessions.sessions.length > 0 ? sessions.sessions : ["default"]).forEach(addSession);
+      if ([...sessionElement.options].some((option) => option.value === "default")) {
+        sessionElement.value = "default";
+      }
+    }
+
+    newSessionElement.addEventListener("click", () => {
+      const sessionId = prompt("输入 Session 名称（字母、数字、下划线或连字符）：");
+      if (sessionId === null) return;
+      if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
+        alert("Session 名称不合法");
+        return;
+      }
+      addSession(sessionId);
+      sessionElement.value = sessionId;
+      messagesElement.replaceChildren();
+    });
+
+    sessionElement.addEventListener("change", () => {
+      messagesElement.replaceChildren();
+      assistantOutput = null;
+    });
+
+    function describeAgentEvent(event) {
+      if (event.type === "tool_start") return "[工具] " + event.name + " 执行中...";
+      if (event.type === "tool_approved") return "[工具] " + event.name + " 已允许";
+      if (event.type === "tool_denied") return "[工具] " + event.name + " 已拒绝";
+      if (event.type === "tool_end") return "[工具] " + event.name + (event.isError ? " 失败" : " 完成");
+      if (event.type === "context_compaction_start") return "[会话] 正在压缩上下文...";
+      if (event.type === "context_compaction_end") return "[会话] 上下文压缩完成";
+      return null;
+    }
+
+    async function decideConfirmation(requestId, sessionId, approved, buttons) {
+      buttons.forEach((button) => { button.disabled = true; });
+      const response = await fetch("/api/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId, sessionId, approved }),
+      });
+      if (!response.ok) throw new Error("确认请求已失效");
+    }
+
+    function showConfirmation(payload, sessionId) {
+      let input = JSON.stringify(payload.request.input, null, 2) ?? String(payload.request.input);
+      if (input.length > 2000) input = input.slice(0, 2000) + "\n...（已截断）";
+      const view = appendMessage("工具确认", payload.request.name + "\n" + input);
+      const allow = document.createElement("button");
+      const deny = document.createElement("button");
+      allow.textContent = "允许";
+      deny.textContent = "拒绝";
+      view.container.append(allow, deny);
+      const buttons = [allow, deny];
+      allow.addEventListener("click", () => decideConfirmation(payload.requestId, sessionId, true, buttons).catch(showError));
+      deny.addEventListener("click", () => decideConfirmation(payload.requestId, sessionId, false, buttons).catch(showError));
+    }
+
+    function handlePayload(payload, sessionId) {
+      if (payload.type === "agent_event") {
+        if (payload.event.type === "text_delta") appendAssistantText(payload.event.text);
+        const description = describeAgentEvent(payload.event);
+        if (description) appendMessage("状态", description);
+        return;
+      }
+      if (payload.type === "confirmation_required") showConfirmation(payload, sessionId);
+      if (payload.type === "error") appendMessage("错误", payload.message);
+    }
+
+    function consumeSseFrame(frame, sessionId) {
+      const data = frame.split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n");
+      if (data.length > 0) handlePayload(JSON.parse(data), sessionId);
+    }
+
+    async function streamChat(sessionId, message) {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, message }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({ error: response.statusText }));
+        throw new Error(body.error || "请求失败");
+      }
+      if (!response.body) throw new Error("浏览器不支持流式响应");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const result = await reader.read();
+        buffer += decoder.decode(result.value, { stream: !result.done });
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+          consumeSseFrame(buffer.slice(0, boundary), sessionId);
+          buffer = buffer.slice(boundary + 2);
+        }
+        if (result.done) break;
+      }
+      if (buffer.trim().length > 0) consumeSseFrame(buffer, sessionId);
+    }
+
+    function showError(error) {
+      appendMessage("错误", error instanceof Error ? error.message : String(error));
+    }
+
+    formElement.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const sessionId = sessionElement.value;
+      const message = messageElement.value.trim();
+      if (!sessionId || !message) return;
+      addSession(sessionId);
+      appendMessage("你", message);
+      assistantOutput = null;
+      messageElement.value = "";
+      sendElement.disabled = true;
+      sessionElement.disabled = true;
+      newSessionElement.disabled = true;
+      try {
+        await streamChat(sessionId, message);
+      } catch (error) {
+        showError(error);
+      } finally {
+        sendElement.disabled = false;
+        sessionElement.disabled = false;
+        newSessionElement.disabled = false;
+        messageElement.focus();
+      }
+    });
+
+    loadPageData().catch(showError);
+  </script>
+</body>
+</html>
+`;
