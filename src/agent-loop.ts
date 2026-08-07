@@ -3,9 +3,11 @@ import { executeTool, requiresToolConfirmation, type ToolContext } from "./tools
 export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.`;
 
 export interface ToolCallRequest {
+  // id 由 Provider API 生成，回填工具结果时必须原样使用。
   id: string;
   name: string;
   input: unknown;
+  // Provider 解析参数失败时不终止整轮，而是把错误交给统一工具结果流程。
   inputError?: string;
 }
 
@@ -26,6 +28,10 @@ export type ToolExecutor = (name: string, input: unknown, context: ToolContext) 
 
 export type AgentEvent =
   | { type: "text_delta"; text: string }
+  // start 事件在摘要 API 请求发出前触发，用于给慢请求提供终端反馈。
+  | { type: "context_compaction_start"; estimatedTokens: number }
+  // end 事件只在摘要和历史替换都成功后触发。
+  | { type: "context_compaction_end"; beforeTokens: number; afterTokens: number }
   | { type: "tool_pending"; toolCallId: string; name: string; input: unknown }
   | { type: "tool_approved"; toolCallId: string; name: string }
   | { type: "tool_denied"; toolCallId: string; name: string }
@@ -35,20 +41,31 @@ export type AgentEvent =
 export type AgentEventHandler = (event: AgentEvent) => void;
 export type TextDeltaHandler = (text: string) => void;
 
+export interface ContextCompactionResult {
+  // 两个数字都是统一估算器的结果，用于 CLI 观察压缩效果，不代表 API 计费 token。
+  beforeTokens: number;
+  afterTokens: number;
+}
+
 export type ProviderTurn =
+  // Provider 将厂商原生 tool_use/function_call 归一化为可能包含多个调用的列表。
   | {
       type: "tool_calls";
       calls: ToolCallRequest[];
     }
+  // 所有不再需要工具的终态都收敛为 final，stopReason 保留厂商状态便于观察。
   | {
       type: "final";
       text: string;
       stopReason: string;
     };
 
-// AgentLoop 只依赖这三个语义动作，不了解 Anthropic content block 或 OpenAI response item。
+// AgentLoop 只依赖这些统一语义动作，不了解 Anthropic content block 或 OpenAI response item。
 // 各 Provider 负责把统一动作转换成自己的 API 格式，并保存必须原样回放的原生历史。
 export interface AgentProvider {
+  // 可选方法使无历史或不支持压缩的 Provider 仍可复用 AgentLoop。
+  // 具体 Provider 拥有原生历史，因此由它负责找安全切分点并生成合法替换结构。
+  compactHistoryIfNeeded?(onStart?: (estimatedTokens: number) => void): Promise<ContextCompactionResult | undefined>;
   addUserText(text: string): Promise<void>;
   generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn>;
   addToolResults(results: ToolExecutionResult[]): Promise<void>;
@@ -80,7 +97,9 @@ export class AgentLoop {
     this.provider = options.provider;
     this.toolContext = options.toolContext;
     this.systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    // 迭代上限防止模型在“调工具 -> 看结果 -> 再调工具”中无限循环。
     this.maxIterations = options.maxIterations ?? 8;
+    // 正常运行使用 executeTool；可注入执行器便于测试“拒绝后绝对不执行”等调度语义。
     this.toolExecutor = options.toolExecutor ?? executeTool;
   }
 
@@ -89,9 +108,24 @@ export class AgentLoop {
     onEvent?: AgentEventHandler,
     confirmTool?: ToolConfirmationHandler,
   ): Promise<TurnResult> {
+    // 压缩必须放在 addUserText 之前：
+    // 1. 此时上一轮已经完整结束，不会把当前工具调用链拦腰切断；
+    // 2. 新的用户问题不会被误放进“早期历史”摘要；
+    // 3. 摘要失败时还没有持久化本轮用户消息，用户可以安全重试。
+    const compaction = await this.provider.compactHistoryIfNeeded?.((estimatedTokens) => {
+      onEvent?.({ type: "context_compaction_start", estimatedTokens });
+    });
+
+    if (compaction) {
+      // Provider 返回结果意味着新历史已持久化并替换内存，此时才对外宣布完成。
+      onEvent?.({ type: "context_compaction_end", ...compaction });
+    }
+
     await this.provider.addUserText(userText);
 
     for (let iteration = 0; iteration < this.maxIterations; iteration += 1) {
+      // 每次循环对应一次模型调用。一轮对话可能因工具结果回填而经历多次模型调用。
+      // streamedText 只记录当前这次调用，用来判断 final text 是否已经通过 delta 显示过。
       let streamedText = "";
       const turn = await this.provider.generateTurn(this.systemPrompt, onEvent ? (text) => {
         streamedText += text;
@@ -106,6 +140,7 @@ export class AgentLoop {
       // 完成确认后，允许执行的工具仍然通过 Promise.all 并行运行。
       const decisions: Array<{ call: ToolCallRequest; approved: boolean }> = [];
       for (const call of turn.calls) {
+        // 自动放行表只包含纯计算/只读工具；未登记工具会走默认拒绝的确认分支。
         if (!requiresToolConfirmation(call.name)) {
           decisions.push({ call, approved: true });
           continue;
@@ -135,8 +170,12 @@ export class AgentLoop {
       }
 
       const results = await Promise.all(
+        // Promise.all 保留输入数组的结果顺序，即使各工具完成先后不同，
+        // 回填给 Provider 的顺序仍与模型原始 calls 一致。
         decisions.map(async ({ call, approved }): Promise<ToolExecutionResult> => {
           if (!approved) {
+            // 拒绝不抛出宿主异常，而是形成可回放的错误工具结果。
+            // 这样模型能解释操作被取消，或改用无工具方案继续回复。
             return {
               toolCallId: call.id,
               output: `Tool execution denied by user: ${call.name}`,
@@ -148,6 +187,7 @@ export class AgentLoop {
           let result: ToolExecutionResult;
           try {
             if (call.inputError) {
+              // 参数在 Provider 层已发现无法解析，必须在调用 toolExecutor 前转成错误。
               throw new Error(call.inputError);
             }
             result = {
@@ -167,6 +207,8 @@ export class AgentLoop {
         }),
       );
 
+      // 工具结果回填后不立即返回用户，而是进入下一次模型迭代。
+      // 模型可以基于结果组织最终答案，或者发起下一组工具调用。
       await this.provider.addToolResults(results);
     }
 
@@ -181,13 +223,16 @@ function emitUnstreamedFinalText(
   streamedText: string,
   onEvent?: AgentEventHandler,
 ): void {
+  // 没有 renderer 时调用方只使用 TurnResult，不需要生成事件。
   if (!onEvent || finalText.length === 0) return;
   if (streamedText.length === 0) {
+    // Provider 不支持流式时，把完整结果伪装成一个 delta，CLI 渲染器无需分两套代码。
     onEvent({ type: "text_delta", text: finalText });
     return;
   }
 
   // Provider 的最终文本可能追加 max_tokens / incomplete 提示；只补发未出现在流中的后缀。
+  // 如果 finalText 与已流式显示的文本不是前缀关系，宁可不重复输出，也不把两个版本拼在一起。
   const normalizedStreamedText = streamedText.trim();
   if (normalizedStreamedText.length > 0 && finalText.startsWith(normalizedStreamedText)) {
     const suffix = finalText.slice(normalizedStreamedText.length);

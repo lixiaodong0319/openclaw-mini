@@ -207,6 +207,8 @@ export async function executeTool(
 }
 
 function parseListDirectoryInput(input: unknown): ListDirectoryInput {
+  // JSON Schema 能约束模型的正常输出，但不是宿主的安全校验。
+  // 兼容 Provider、手写测试或未来非 strict 模型时，工具入口仍必须把 input 当 unknown。
   if (!isRecord(input) || typeof input.path !== "string") {
     throw new Error("list_directory requires a string path");
   }
@@ -225,6 +227,8 @@ function parseReadTextFileInput(input: unknown): ReadTextFileInput {
 }
 
 function parseWriteTextFileInput(input: unknown): WriteTextFileInput {
+  // 写入路径和内容必须同时存在；不把 null/undefined 隐式转成字符串，
+  // 否则模型参数错误可能意外覆盖文件为 "undefined"。
   if (!isRecord(input) || typeof input.path !== "string" || typeof input.content !== "string") {
     throw new Error("write_text_file requires string path and content");
   }
@@ -233,6 +237,7 @@ function parseWriteTextFileInput(input: unknown): WriteTextFileInput {
 }
 
 function parseEditTextFileInput(input: unknown): EditTextFileInput {
+  // 使用 API 字段名 old_text/new_text 与 schema 保持一致，进入内部后转成 camelCase。
   if (
     !isRecord(input)
     || typeof input.path !== "string"
@@ -242,6 +247,7 @@ function parseEditTextFileInput(input: unknown): EditTextFileInput {
     throw new Error("edit_text_file requires string path, old_text, and new_text");
   }
   if (input.old_text.length === 0) {
+    // 空字符串在任何位置都能“匹配”，如果允许会使精确替换语义失效。
     throw new Error("edit_text_file old_text must not be empty");
   }
 
@@ -307,15 +313,19 @@ async function readTextFile(input: ReadTextFileInput, context: ToolContext): Pro
 }
 
 async function writeTextFile(input: WriteTextFileInput, context: ToolContext): Promise<string> {
+  // 限制的是 UTF-8 落盘字节数，而不是 JavaScript UTF-16 string.length；
+  // 这样中文、emoji 等多字节内容不会绕过文件大小上限。
   const bytes = Buffer.byteLength(input.content, "utf8");
   if (bytes > MAX_FILE_BYTES) {
     throw new Error(`content is too large; maximum is ${MAX_FILE_BYTES} bytes`);
   }
 
+  // 先完成语法路径、真实路径、符号链接和文件类型检查，然后才执行有副作用的 writeFile。
   const { root, target, existed } = await resolveWorkspaceWritePath(input.path, context);
   await fs.writeFile(target, input.content, "utf8");
 
   const relativePath = path.relative(root, target).split(path.sep).join("/");
+  // 返回结构化 JSON 文本，让模型能区分“新建”和“覆盖”，并核对实际字节数。
   return JSON.stringify({
     path: relativePath,
     bytes,
@@ -324,6 +334,8 @@ async function writeTextFile(input: WriteTextFileInput, context: ToolContext): P
 }
 
 async function editTextFile(input: EditTextFileInput, context: ToolContext): Promise<string> {
+  // 精确编辑不允许新建文件；新建和全量覆盖由 write_text_file 负责，
+  // 两个工具能力分开后，确认界面上的操作意图更清晰。
   const { root, target, existed } = await resolveWorkspaceWritePath(input.path, context);
   if (!existed) {
     throw new Error("path does not exist");
@@ -335,6 +347,8 @@ async function editTextFile(input: EditTextFileInput, context: ToolContext): Pro
   }
 
   const content = await fs.readFile(target, "utf8");
+  // 先找第一次，再从下一个字符开始找第二次，也能发现重叠匹配。
+  // 必须唯一匹配，否则模型应先读文件并提供更多上下文，而不是猜测要改哪一处。
   const matchIndex = content.indexOf(input.oldText);
   if (matchIndex === -1) {
     throw new Error("old_text was not found");
@@ -343,14 +357,18 @@ async function editTextFile(input: EditTextFileInput, context: ToolContext): Pro
     throw new Error("old_text occurs more than once; include more surrounding text");
   }
 
+  // 不用 String.replace 的正则表达式形态，old_text/new_text 始终是字面文本，
+  // `$&`、反斜杠或正则元字符都不会被当成特殊替换语法。
   const updatedContent = `${content.slice(0, matchIndex)}${input.newText}${content.slice(matchIndex + input.oldText.length)}`;
   const bytes = Buffer.byteLength(updatedContent, "utf8");
   if (bytes > MAX_FILE_BYTES) {
     throw new Error(`edited content is too large; maximum is ${MAX_FILE_BYTES} bytes`);
   }
 
+  // 先在内存中完成替换与结果大小检查，所有检查通过后只写盘一次。
   await fs.writeFile(target, updatedContent, "utf8");
 
+  // line/column 都是 1-based，便于模型回复和人类编辑器定位。
   const beforeMatch = content.slice(0, matchIndex);
   const lastNewlineIndex = beforeMatch.lastIndexOf("\n");
   return JSON.stringify({
@@ -378,8 +396,10 @@ async function listDirectory(input: ListDirectoryInput, context: ToolContext): P
   }
 
   const allEntries = await fs.readdir(realTarget, { withFileTypes: true });
+  // 文件系统返回顺序不稳定，先按名称排序可使模型上下文、测试和用户输出可重复。
   allEntries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
 
+  // 先截断再读元数据，避免对超大目录的所有文件发起 lstat。
   const selectedEntries = allEntries.slice(0, MAX_DIRECTORY_ENTRIES);
   const entries = await Promise.all(selectedEntries.map(async (entry) => {
     const type = getDirectoryEntryType(entry);
@@ -439,6 +459,8 @@ async function resolveWorkspaceWritePath(
   requestedPath: string,
   context: ToolContext,
 ): Promise<{ root: string; target: string; existed: boolean }> {
+  // 写入路径比读取路径复杂：新文件尚不存在，不能直接对 target 调用 realpath。
+  // 因此先做不需要目标存在的语法边界检查，再分“已存在”和“待创建”两条分支。
   if (path.isAbsolute(requestedPath)) {
     throw new Error("path must be relative to the workspace");
   }
@@ -452,6 +474,7 @@ async function resolveWorkspaceWritePath(
 
   let targetStat: import("node:fs").Stats | undefined;
   try {
+    // lstat 不跟随最后一段符号链接，因此可以在覆盖前显式拒绝 symlink 目标。
     targetStat = await fs.lstat(target);
   } catch (error) {
     if (!isFileSystemError(error, "ENOENT")) {
@@ -460,6 +483,8 @@ async function resolveWorkspaceWritePath(
   }
 
   if (targetStat) {
+    // 已存在的目标只允许普通文件。拒绝目录、设备文件和 symlink，
+    // 既防止越界，也避免“覆盖”语义指向用户没有确认的另一个目标。
     if (targetStat.isSymbolicLink()) {
       throw new Error("write target must not be a symbolic link");
     }
@@ -477,6 +502,8 @@ async function resolveWorkspaceWritePath(
 
   let realParent: string;
   try {
+    // 对新文件验证真实父目录。如果 workspace 内有一个指向外部的目录 symlink，
+    // realpath(parent) 会暴露其真实位置，下方 parentRelative 检查会拒绝该写入。
     realParent = await fs.realpath(path.dirname(target));
   } catch (error) {
     if (isFileSystemError(error, "ENOENT")) {
@@ -498,6 +525,8 @@ async function resolveWorkspaceWritePath(
 }
 
 function isOutsideRoot(relativePath: string): boolean {
+  // path.relative 在目标位于 root 内时不会以 .. 开头。
+  // 额外检查 path.isAbsolute 可覆盖 Windows 不同盘符时 relative 返回绝对路径的情况。
   return relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath);
 }
 

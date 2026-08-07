@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 // 简单的泛型 JSONL 会话存储。
-// JSONL 的好处是每条消息可以独立追加，不需要每次把整个会话文件读出、修改、再覆盖写回。
+// 平时逐条追加；只有上下文压缩后才原子替换整个历史文件。
 // 对这个 MVP 来说，它比数据库更容易观察，也方便手动查看一次会话中模型和工具之间发生了什么。
 export class SessionStore<T = Anthropic.MessageParam> {
   private readonly filePath: string;
@@ -57,6 +57,25 @@ export class SessionStore<T = Anthropic.MessageParam> {
     // 每条消息一行，按发生顺序追加。
     // MVP 限定单进程单 session 写入，所以暂不引入文件锁或数据库事务。
     await fs.appendFile(this.filePath, `${JSON.stringify(message)}\n`, "utf8");
+  }
+
+  async replace(messages: T[]): Promise<void> {
+    // 压缩后的数组已经是完整、有序的 Provider 原生历史。
+    // 这里仍保持“每条历史一行”的 JSONL 格式，load() 不需要区分是原始会话还是压缩会话。
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    const content = messages.map((message) => JSON.stringify(message)).join("\n");
+    const temporaryPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+
+    // 临时文件与目标位于同一目录，rename 不需要跨文件系统复制。
+    // 先完整写入再 rename 替换，可避免进程在 writeFile 中途退出时留下半截主 JSONL。
+    try {
+      await fs.writeFile(temporaryPath, content.length > 0 ? `${content}\n` : "", "utf8");
+      await fs.rename(temporaryPath, this.filePath);
+    } catch (error) {
+      // 临时文件是可回收的中间状态；主历史仍保持 rename 之前的完整内容。
+      await fs.rm(temporaryPath, { force: true });
+      throw error;
+    }
   }
 }
 

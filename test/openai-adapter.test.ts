@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { AgentLoop, type AgentEvent } from "../src/agent-loop.js";
+import type { ContextCompactionOptions } from "../src/context-compaction.js";
 import { OpenAIProvider, type OpenAIInputItem, type OpenAIResponseItem } from "../src/provider.js";
 import { openAIResponse, FakeOpenAIProvider } from "./fake-openai-provider.js";
 
@@ -31,6 +32,8 @@ function createLoop(
   options: {
     onItem?: (item: OpenAIInputItem) => Promise<void>;
     maxIterations?: number;
+    compaction?: Partial<ContextCompactionOptions>;
+    onHistoryReplace?: (items: OpenAIInputItem[]) => Promise<void>;
   } = {},
 ): AgentLoop {
   return new AgentLoop({
@@ -39,6 +42,8 @@ function createLoop(
       model: "gpt-5.3-codex",
       input,
       onItem: options.onItem,
+      onHistoryReplace: options.onHistoryReplace,
+      compaction: options.compaction,
     }),
     toolContext: { workspaceRoot },
     maxIterations: options.maxIterations,
@@ -79,6 +84,54 @@ describe("OpenAIProvider adapter", () => {
       { type: "text_delta", text: "hel" },
       { type: "text_delta", text: "lo" },
     ]);
+  });
+
+  it("compacts old OpenAI history while preserving recent function call items", async () => {
+    const recentReasoning = { type: "reasoning", id: "rs_recent", summary: [] } satisfies OpenAIResponseItem;
+    const recentCall = functionCall("call_recent", "calculator", { operation: "add", a: 1, b: 2 });
+    const recentOutput: OpenAIInputItem = {
+      type: "function_call_output",
+      call_id: "call_recent",
+      output: "3",
+    };
+    const input: OpenAIInputItem[] = [
+      { role: "user", content: "old detail ".repeat(500) },
+      outputMessage("old answer"),
+      { role: "user", content: "recent question" },
+      recentReasoning,
+      recentCall,
+      recentOutput,
+      outputMessage("recent answer"),
+    ];
+    const client = new FakeOpenAIProvider([
+      openAIResponse([outputMessage("compressed old facts")]),
+      openAIResponse([outputMessage("new answer")]),
+    ]);
+    const replacements: OpenAIInputItem[][] = [];
+    const loop = createLoop(client, input, workspaceRoot, {
+      compaction: { tokenThreshold: 10, keepRecentTurns: 1, summaryMaxTokens: 100 },
+      onHistoryReplace: async (replacement) => {
+        replacements.push(structuredClone(replacement));
+      },
+    });
+    const events: AgentEvent[] = [];
+
+    await loop.runTurn("new question", (event) => events.push(event));
+
+    expect(client.calls).toHaveLength(2);
+    expect(client.calls[0]?.tools).toEqual([]);
+    expect(client.calls[0]?.max_output_tokens).toBe(100);
+    expect(replacements[0]?.[0]).toEqual({
+      role: "user",
+      content: "[压缩的早期会话摘要]\ncompressed old facts",
+    });
+    const requestInput = client.calls[1]?.input ?? [];
+    expect(requestInput).toContainEqual(recentReasoning);
+    expect(requestInput).toContainEqual(recentCall);
+    expect(requestInput).toContainEqual(recentOutput);
+    expect(requestInput.at(-1)).toEqual({ role: "user", content: "new question" });
+    expect(events[0]).toMatchObject({ type: "context_compaction_start" });
+    expect(events[1]).toMatchObject({ type: "context_compaction_end" });
   });
 
   it("preserves reasoning items and returns function output", async () => {

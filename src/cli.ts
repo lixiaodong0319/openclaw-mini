@@ -19,6 +19,10 @@ import {
   getModelId,
   type OpenAIInputItem,
 } from "./provider.js";
+import {
+  DEFAULT_CONTEXT_COMPACTION_OPTIONS,
+  resolveContextCompactionOptions,
+} from "./context-compaction.js";
 import { SessionStore } from "./session-store.js";
 
 async function main(): Promise<void> {
@@ -28,7 +32,7 @@ async function main(): Promise<void> {
   const providerName = getProviderName();
   const projectRoot = process.cwd();
 
-  // workspace 是 Agent 唯一能通过目录浏览和文件读取工具访问的目录。
+  // workspace 是 Agent 唯一能通过文件工具读写的目录。
   // data 只用于宿主程序存会话，不作为工具 workspace 暴露给模型。
   // 这两个目录分离，可以降低模型读取自身历史或内部状态的机会。
   const workspaceRoot = path.join(projectRoot, "workspace");
@@ -50,6 +54,8 @@ async function main(): Promise<void> {
   const rl = createInterface({ input, output });
   try {
     while (true) {
+      // 一次 question 对应一个完整用户轮次。AgentLoop 运行期间如果需要工具确认，
+      // 会复用同一个 readline Interface 追加 question，避免多个 stdin 监听器争抢输入。
       const line = (await rl.question("> ")).trim();
       if (line.length === 0) {
         continue;
@@ -73,17 +79,20 @@ async function main(): Promise<void> {
       }
     }
   } finally {
+    // 无论用户 /exit 还是循环中发生未捕获错误，都释放 stdin 和进程事件监听。
     rl.close();
   }
 }
 
 function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: () => void } {
+  // 模型文本使用 stdout.write 增量输出，不保证最后一个 delta 以换行结束。
+  // lineOpen 记录光标是否仍在模型文本行上，插入工具/会话状态前先补换行。
   let lineOpen = false;
   let finished = false;
 
-  const writeStatus = (message: string): void => {
+  const writeStatus = (category: "工具" | "会话", message: string): void => {
     if (lineOpen) output.write("\n");
-    output.write(`[工具] ${message}\n`);
+    output.write(`[${category}] ${message}\n`);
     lineOpen = false;
   };
 
@@ -95,27 +104,37 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
         lineOpen = !event.text.endsWith("\n");
         return;
       }
+      if (event.type === "context_compaction_start") {
+        // 压缩需要额外调用一次模型，用独立“会话”分类避免被误认为工具调用。
+        writeStatus("会话", `正在压缩上下文（约 ${event.estimatedTokens} tokens）...`);
+        return;
+      }
+      if (event.type === "context_compaction_end") {
+        writeStatus("会话", `上下文压缩完成（${event.beforeTokens} → ${event.afterTokens} tokens）`);
+        return;
+      }
       if (event.type === "tool_start") {
-        writeStatus(`${event.name} 执行中...`);
+        writeStatus("工具", `${event.name} 执行中...`);
         return;
       }
       if (event.type === "tool_pending") {
-        writeStatus(`${event.name} 等待确认`);
+        writeStatus("工具", `${event.name} 等待确认`);
         return;
       }
       if (event.type === "tool_approved") {
-        writeStatus(`${event.name} 已允许`);
+        writeStatus("工具", `${event.name} 已允许`);
         return;
       }
       if (event.type === "tool_denied") {
-        writeStatus(`${event.name} 已拒绝`);
+        writeStatus("工具", `${event.name} 已拒绝`);
         return;
       }
       if (event.type === "tool_end") {
-        writeStatus(`${event.name} ${event.isError ? "失败" : "完成"}`);
+        writeStatus("工具", `${event.name} ${event.isError ? "失败" : "完成"}`);
       }
     },
     finish: () => {
+      // finish 可在正常结束和 catch 分支被调用，幂等保护可避免多打一个空行。
       if (finished) return;
       if (lineOpen) output.write("\n");
       output.write("\n");
@@ -128,15 +147,20 @@ async function confirmToolCall(
   rl: Interface,
   request: ToolConfirmationRequest,
 ): Promise<boolean> {
+  // 先显示模型生成的完整结构化参数预览，再读取用户决定。
+  // 默认是拒绝：只有明确的 y/yes 才返回 true，回车、拼写错误和其他输入都不执行。
   output.write(`参数:\n${formatToolInput(request.input)}\n`);
   const answer = (await rl.question(`允许执行 ${request.name}？[y/N] `)).trim().toLowerCase();
   return answer === "y" || answer === "yes";
 }
 
 function formatToolInput(input: unknown): string {
+  // 工具参数可能包含整个文件内容。设置终端预览上限，防止一次确认刷屏数万行。
+  // 这只影响展示，AgentLoop 传给工具的 input 仍是未截断的原对象。
   const maxLength = 2_000;
   let text: string;
   try {
+    // 正常模型参数都是 JSON 值；String fallback 使测试注入循环引用等非 JSON 值时也能显示。
     text = JSON.stringify(input, null, 2) ?? String(input);
   } catch {
     text = String(input);
@@ -154,6 +178,7 @@ async function createAgent(
   sessionId: string,
   workspaceRoot: string,
 ): Promise<{ agent: AgentLoop; model: string }> {
+  const compaction = getContextCompactionOptions();
   if (providerName === "openai") {
     // OpenAI Responses API 的历史包含 message、reasoning、function_call 和 function_call_output item。
     // 使用独立 namespace，防止和 Anthropic Messages API 的 JSONL 结构混在同一个 session 文件里。
@@ -167,6 +192,9 @@ async function createAgent(
           model,
           input,
           onItem: (item) => store.append(item),
+          // 普通 item 仍逐条 append；只有 Provider 压缩成功时才回调 replace。
+          onHistoryReplace: (items) => store.replace(items),
+          compaction,
         }),
         toolContext: { workspaceRoot },
       }),
@@ -184,15 +212,51 @@ async function createAgent(
         model,
         messages,
         onMessage: (message) => store.append(message),
+        // Anthropic 与 OpenAI 使用各自的 SessionStore namespace，但整体替换语义相同。
+        onHistoryReplace: (replacement) => store.replace(replacement),
+        compaction,
       }),
       toolContext: { workspaceRoot },
     }),
   };
 }
 
+function getContextCompactionOptions() {
+  // 环境变量只在 CLI 组装 Provider 时读取一次。
+  // 测试可以绕过 process.env，直接通过 Provider options 注入更小阈值。
+  return resolveContextCompactionOptions({
+    tokenThreshold: readPositiveIntegerEnvironment(
+      "OPENCLAW_COMPACT_THRESHOLD",
+      DEFAULT_CONTEXT_COMPACTION_OPTIONS.tokenThreshold,
+    ),
+    keepRecentTurns: readPositiveIntegerEnvironment(
+      "OPENCLAW_COMPACT_KEEP_TURNS",
+      DEFAULT_CONTEXT_COMPACTION_OPTIONS.keepRecentTurns,
+    ),
+    summaryMaxTokens: readPositiveIntegerEnvironment(
+      "OPENCLAW_COMPACT_SUMMARY_TOKENS",
+      DEFAULT_CONTEXT_COMPACTION_OPTIONS.summaryMaxTokens,
+    ),
+  });
+}
+
+function readPositiveIntegerEnvironment(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (value === undefined || value.length === 0) {
+    return fallback;
+  }
+  const parsed = Number(value);
+  // 不接受 0、负数、小数或非数字，避免错误配置导致每轮都压缩或行为不稳定。
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
+}
+
 type ProviderName = "anthropic" | "openai";
 
 function getProviderName(): ProviderName {
+  // 只允许显式白名单，避免配置拼写错误时静默回退到另一个 Provider 并使用错误的凭据/会话格式。
   const value = (process.env.OPENCLAW_PROVIDER || "anthropic").toLowerCase();
   if (value === "anthropic") {
     return value;

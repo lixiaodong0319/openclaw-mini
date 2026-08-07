@@ -36,6 +36,17 @@ describe("SessionStore", () => {
     await expect(openAIStore.load()).resolves.toEqual(["openai"]);
   });
 
+  it("atomically replaces compacted history", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-store-"));
+    const store = new SessionStore<string>(root, "compact");
+    await store.append("old-1");
+    await store.append("old-2");
+
+    await store.replace(["summary", "recent"]);
+
+    await expect(store.load()).resolves.toEqual(["summary", "recent"]);
+  });
+
   it("reports invalid JSONL", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-store-"));
     await fs.mkdir(path.join(root, "sessions"));

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { AgentLoop, type AgentEvent, type ToolExecutor } from "../src/agent-loop.js";
+import type { ContextCompactionOptions } from "../src/context-compaction.js";
 import { AnthropicProvider, type MessageProvider } from "../src/provider.js";
 import { FakeProvider, message } from "./fake-provider.js";
 
@@ -22,6 +23,8 @@ function createLoop(
     onMessage?: (message: Anthropic.MessageParam) => Promise<void>;
     maxIterations?: number;
     toolExecutor?: ToolExecutor;
+    compaction?: Partial<ContextCompactionOptions>;
+    onHistoryReplace?: (messages: Anthropic.MessageParam[]) => Promise<void>;
   } = {},
 ): AgentLoop {
   return new AgentLoop({
@@ -30,6 +33,8 @@ function createLoop(
       model: "claude-opus-5",
       messages,
       onMessage: options.onMessage,
+      onHistoryReplace: options.onHistoryReplace,
+      compaction: options.compaction,
     }),
     toolContext: { workspaceRoot },
     maxIterations: options.maxIterations,
@@ -71,6 +76,62 @@ describe("AgentLoop", () => {
       { type: "text_delta", text: "hel" },
       { type: "text_delta", text: "lo" },
     ]);
+  });
+
+  it("compacts old Anthropic history while preserving a recent tool chain", async () => {
+    const recentToolUse = toolUseBlock("toolu_recent", "calculator", { operation: "add", a: 1, b: 2 });
+    const recentToolResult: Anthropic.MessageParam = {
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_recent",
+        content: [{ type: "text", text: "3" }],
+      }],
+    };
+    const messages: Anthropic.MessageParam[] = [
+      { role: "user", content: [{ type: "text", text: "old detail ".repeat(500) }] },
+      { role: "assistant", content: [{ type: "text", text: "old answer" }] },
+      { role: "user", content: [{ type: "text", text: "recent question" }] },
+      { role: "assistant", content: [recentToolUse] },
+      recentToolResult,
+      { role: "assistant", content: [{ type: "text", text: "recent answer" }] },
+    ];
+    const client = new FakeProvider([
+      message([textBlock("compressed old facts")], "end_turn"),
+      message([textBlock("new answer")], "end_turn"),
+    ]);
+    const replacements: Anthropic.MessageParam[][] = [];
+    const loop = createLoop(client, messages, workspaceRoot, {
+      compaction: { tokenThreshold: 10, keepRecentTurns: 1, summaryMaxTokens: 100 },
+      onHistoryReplace: async (replacement) => {
+        replacements.push(structuredClone(replacement));
+      },
+    });
+    const events: AgentEvent[] = [];
+
+    await loop.runTurn("new question", (event) => events.push(event));
+
+    expect(client.calls).toHaveLength(2);
+    expect(client.calls[0]?.tools).toBeUndefined();
+    expect(client.calls[0]?.max_tokens).toBe(100);
+    expect(replacements).toHaveLength(1);
+    expect(replacements[0]?.[0]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "[压缩的早期会话摘要]\ncompressed old facts" }],
+    });
+    const requestHistory = client.calls[1]?.messages ?? [];
+    expect(requestHistory).toContainEqual({ role: "assistant", content: [recentToolUse] });
+    expect(requestHistory).toContainEqual(recentToolResult);
+    expect(requestHistory.at(-1)).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "new question" }],
+    });
+    expect(events[0]).toMatchObject({ type: "context_compaction_start" });
+    expect(events[1]).toMatchObject({ type: "context_compaction_end" });
+    if (events[0]?.type === "context_compaction_start" && events[1]?.type === "context_compaction_end") {
+      expect(events[1].beforeTokens).toBe(events[0].estimatedTokens);
+      expect(events[1].afterTokens).toBeLessThan(events[1].beforeTokens);
+    }
   });
 
   it("emits tool start and completion events", async () => {

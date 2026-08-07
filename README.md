@@ -16,6 +16,7 @@
   - `write_text_file`：确认后创建或覆盖 `workspace/` 内的 UTF-8 文本文件
   - `edit_text_file`：确认后精确替换现有文本文件中的唯一内容块
 - JSONL 会话持久化，支持重启后继续同一 session
+- 长会话自动摘要压缩，保留最近完整轮次和工具调用链
 - Fake Provider 测试，不依赖真实 API Key 或网络
 - TypeScript 严格类型检查
 
@@ -28,7 +29,7 @@
 - 文件删除或重命名工具
 - Shell 执行
 - 浏览器、网络搜索、MCP、多 Agent、记忆系统
-- 上下文压缩、模型 fallback、成本路由
+- 模型 fallback、成本路由
 
 ## 目录结构
 
@@ -36,6 +37,7 @@
 src/
   agent-loop.ts      厂商无关的统一 Agent Loop
   cli.ts             本地命令行入口
+  context-compaction.ts 上下文估算、压缩阈值和保留策略
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   session-store.ts   JSONL 会话存储
   tools.ts           工具定义与执行逻辑
@@ -93,6 +95,18 @@ export OPENCLAW_MODEL="gpt-5.3-codex"
 
 OpenAI Provider 也支持 `OPENAI_MODEL`，但 `OPENCLAW_MODEL` 优先级更高。
 
+### 上下文压缩配置
+
+历史记录默认超过约 32,000 tokens 时，会在下一轮开始前调用当前 Provider 生成早期会话摘要，并保留最近 4 个完整用户轮次。可通过环境变量调整：
+
+```bash
+export OPENCLAW_COMPACT_THRESHOLD="32000"
+export OPENCLAW_COMPACT_KEEP_TURNS="4"
+export OPENCLAW_COMPACT_SUMMARY_TOKENS="2000"
+```
+
+token 数是根据原生历史 JSON 的 UTF-8 大小估算，不是模型 tokenizer 的精确计数。压缩切分点只选在真实用户消息之前，不会拆开工具调用和工具结果。
+
 ### Anthropic SDK profile
 
 如果本机配置了 Anthropic SDK 可识别的本地 profile，也可以使用对应凭据。
@@ -123,6 +137,13 @@ pnpm dev -- --session smoke
 [工具] list_directory 执行中...
 [工具] list_directory 完成
 workspace 中包含 note.txt。
+```
+
+触发上下文压缩时，终端会显示：
+
+```text
+[会话] 正在压缩上下文（约 32840 tokens）...
+[会话] 上下文压缩完成（32840 → 6210 tokens）
 ```
 
 `calculator`、`list_directory` 和 `read_text_file` 是无副作用工具，会自动执行。`write_text_file` 和 `edit_text_file` 是有副作用工具，每次修改前都会显示调用参数并询问：
@@ -218,12 +239,13 @@ pnpm run build
 - workspace 文件读取边界
 - workspace 文件创建、覆盖、大小上限和写入边界
 - workspace 文件唯一内容块替换及零匹配、多匹配保护
+- Anthropic 和 OpenAI 历史摘要压缩与最近工具链保留
+- 压缩后 JSONL 历史原子替换
 - JSONL 会话保存与加载
 
 ## 当前定位
 
 这个项目适合作为最小 Agent Loop 学习样例。后续如果要继续扩展，建议按顺序增加：
 
-1. 上下文压缩或摘要
-2. 多模型或 fallback
-3. Web UI
+1. 多模型或 fallback
+2. Web UI
