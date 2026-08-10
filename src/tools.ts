@@ -9,6 +9,7 @@ import {
   getGitStatus,
   MAX_GIT_DIFF_BYTES,
 } from "./git-tools.js";
+import { DEFAULT_FETCH_BYTES, fetchUrlText, MAX_FETCH_BYTES } from "./fetch-url.js";
 
 // 直接复用 SDK 的 Tool 类型，确保工具定义形状和 Anthropic SDK 保持一致。
 // 不额外声明自定义 Tool interface，可以避免 SDK 升级后字段含义或类型漂移。
@@ -94,6 +95,12 @@ interface GitDiffInput {
   path: string;
   file?: string;
   staged: boolean;
+  maxBytes: number;
+}
+
+interface FetchUrlInput {
+  // maxBytes 由宿主限制范围，模型不能借参数无限扩大响应正文。
+  url: string;
   maxBytes: number;
 }
 
@@ -397,6 +404,29 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "fetch_url",
+    description: "Call this to fetch text from a public HTTP or HTTPS URL. Requests are pinned to validated public DNS addresses, redirects are revalidated, and private/local destinations are blocked. Every call requires user approval.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "Absolute public http or https URL without embedded credentials.",
+        },
+        max_bytes: {
+          anyOf: [
+            { type: "integer", minimum: 1, maximum: MAX_FETCH_BYTES },
+            { type: "null" },
+          ],
+          description: `Maximum response body bytes. Use null for the default of ${DEFAULT_FETCH_BYTES}.`,
+        },
+      },
+      required: ["url", "max_bytes"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "run_command",
     description: "Call this to run a shell command for building, testing, or inspecting the workspace. The command starts in the workspace but is not sandboxed, so every call requires explicit user approval. Do not access paths outside the workspace.",
     strict: true,
@@ -465,6 +495,10 @@ export async function executeTool(
     case "apply_patch": {
       const parsed = parseApplyPatchInput(input);
       return applyWorkspacePatch(parsed.patch, context.workspaceRoot);
+    }
+    case "fetch_url": {
+      const parsed = parseFetchUrlInput(input);
+      return fetchUrlText(parsed.url, parsed.maxBytes);
     }
     case "run_command":
       return runCommand(parseRunCommandInput(input), context);
@@ -639,6 +673,28 @@ function parseApplyPatchInput(input: unknown): ApplyPatchInput {
     throw new Error("apply_patch patch must not be empty");
   }
   return { patch: input.patch };
+}
+
+function parseFetchUrlInput(input: unknown): FetchUrlInput {
+  // schema strict 只约束正常模型输出；工具边界仍把参数当 unknown 再校验一次。
+  if (!isRecord(input) || typeof input.url !== "string") {
+    throw new Error("fetch_url requires a string url");
+  }
+  if (input.url.trim().length === 0) {
+    throw new Error("fetch_url url must not be empty");
+  }
+  if (Buffer.byteLength(input.url, "utf8") > 8192) {
+    throw new Error("fetch_url url is too long; maximum is 8192 bytes");
+  }
+  const maxBytes = input.max_bytes;
+  // OpenAI strict schema 用 null 表示“采用默认值”，同时兼容未传字段的其他调用方。
+  if (
+    maxBytes !== undefined && maxBytes !== null
+    && (typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_FETCH_BYTES)
+  ) {
+    throw new Error(`fetch_url max_bytes must be an integer between 1 and ${MAX_FETCH_BYTES}`);
+  }
+  return { url: input.url, maxBytes: maxBytes ?? DEFAULT_FETCH_BYTES };
 }
 
 // calculator 参数校验分两层：先校验 operation 是否属于枚举，再校验两个操作数是否为有限数字。

@@ -617,6 +617,7 @@ describe("tools", () => {
     expect(requiresToolConfirmation("write_text_file")).toBe(true);
     expect(requiresToolConfirmation("edit_text_file")).toBe(true);
     expect(requiresToolConfirmation("apply_patch")).toBe(true);
+    expect(requiresToolConfirmation("fetch_url")).toBe(true);
     expect(requiresToolConfirmation("run_command")).toBe(true);
     expect(requiresToolConfirmation("shell")).toBe(true);
   });
