@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { applyWorkspacePatch } from "./apply-patch.js";
 
 // 直接复用 SDK 的 Tool 类型，确保工具定义形状和 Anthropic SDK 保持一致。
 // 不额外声明自定义 Tool interface，可以避免 SDK 升级后字段含义或类型漂移。
@@ -30,6 +31,12 @@ interface ReadTextFileInput {
   path: string;
 }
 
+// create_directory 只接受 workspace 相对路径。
+// 它可以递归创建缺失的父目录，但属于有副作用操作，必须先经过用户确认。
+interface CreateDirectoryInput {
+  path: string;
+}
+
 // write_text_file 只接受完整的 UTF-8 文本内容。
 // 写入是有副作用的操作，因此它不在自动放行列表中。
 interface WriteTextFileInput {
@@ -45,10 +52,23 @@ interface EditTextFileInput {
   newText: string;
 }
 
+// apply_patch 接受统一补丁文本，可在一次确认后新增或更新多个文件。
+interface ApplyPatchInput {
+  patch: string;
+}
+
 // list_directory 的模型输入结构。
 // 和 read_text_file 一样只接受 workspace 相对路径；使用 "." 表示 workspace 根目录。
 interface ListDirectoryInput {
   path: string;
+}
+
+// find_files 只查找路径，不读取文件内容。
+// pattern 按 workspace 相对路径匹配，例如 **/*.test.ts。
+interface FindFilesInput {
+  path: string;
+  pattern: string;
+  maxResults: number;
 }
 
 // search_files 在指定目录下递归搜索文本内容。
@@ -80,6 +100,11 @@ const MAX_FILE_BYTES = 1024 * 1024;
 // 限制单次目录列表的规模，防止大型目录一次性占满模型上下文。
 const MAX_DIRECTORY_ENTRIES = 200;
 
+// 文件发现只返回路径，允许比内容搜索更多结果，但仍需限制遍历和返回规模。
+const DEFAULT_FIND_RESULTS = 100;
+const MAX_FIND_RESULTS = 500;
+const MAX_FIND_SCANNED_ENTRIES = 20_000;
+
 // 搜索结果和扫描规模都设置上限，避免大型 workspace 长时间占用 Agent Loop，
 // 也避免匹配内容一次性撑满模型上下文。
 const DEFAULT_SEARCH_RESULTS = 50;
@@ -98,9 +123,9 @@ const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 // 这不是 Shell 沙箱，而是防止 `env` 等普通命令直接暴露 API Key 的额外防线。
 const SENSITIVE_ENVIRONMENT_NAME = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|AUTHORIZATION|COOKIE|SESSION|JWT)(?:_|$)/i;
 
-// 当前四个工具都是只读或纯计算能力，可以直接执行。
+// 当前五个工具都是只读或纯计算能力，可以直接执行。
 // 未登记的新工具默认需要用户确认，避免未来加入写文件、Shell 等能力时意外绕过审批。
-const AUTO_APPROVED_TOOLS = new Set(["calculator", "list_directory", "search_files", "read_text_file"]);
+const AUTO_APPROVED_TOOLS = new Set(["calculator", "list_directory", "find_files", "search_files", "read_text_file"]);
 
 export function requiresToolConfirmation(name: string): boolean {
   return !AUTO_APPROVED_TOOLS.has(name);
@@ -142,6 +167,34 @@ export const toolDefinitions: ToolDefinition[] = [
         },
       },
       required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "find_files",
+    description: "Call this to recursively discover regular files by workspace-relative path. Supports simple glob wildcards (*, **, and ?), skips symbolic links, and does not read file contents.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Workspace-relative directory to search recursively. Use '.' for the workspace root.",
+        },
+        pattern: {
+          type: "string",
+          description: "Glob matched against workspace-relative file paths, for example '**/*.test.ts'.",
+        },
+        max_results: {
+          anyOf: [
+            { type: "integer", minimum: 1, maximum: MAX_FIND_RESULTS },
+            { type: "null" },
+          ],
+          description: `Maximum file paths to return. Use null for the default of ${DEFAULT_FIND_RESULTS}.`,
+        },
+      },
+      // max_results 使用 nullable required 字段，保持 OpenAI strict schema 合法。
+      required: ["path", "pattern", "max_results"],
       additionalProperties: false,
     },
   },
@@ -195,6 +248,22 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "create_directory",
+    description: "Call this to create a directory inside the workspace, including missing parent directories. The user must approve every call before it executes.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Workspace-relative path of the directory to create.",
+        },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "write_text_file",
     description: "Call this to create or overwrite a UTF-8 text file inside the workspace. The user must approve every write before it executes. The parent directory must already exist.",
     strict: true,
@@ -239,6 +308,22 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "apply_patch",
+    description: "Call this to add or update one or more workspace files with an exact Begin Patch/End Patch document. Update hunks must match existing text exactly. File deletion is not supported. The user must approve the complete patch before it executes.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        patch: {
+          type: "string",
+          description: "Patch text using '*** Begin Patch', '*** Add File:' or '*** Update File:', '@@' hunks, and '*** End Patch'.",
+        },
+      },
+      required: ["patch"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "run_command",
     description: "Call this to run a shell command for building, testing, or inspecting the workspace. The command starts in the workspace but is not sandboxed, so every call requires explicit user approval. Do not access paths outside the workspace.",
     strict: true,
@@ -279,14 +364,22 @@ export async function executeTool(
       return runCalculator(parseCalculatorInput(input));
     case "list_directory":
       return listDirectory(parseListDirectoryInput(input), context);
+    case "find_files":
+      return findFiles(parseFindFilesInput(input), context);
     case "search_files":
       return searchFiles(parseSearchFilesInput(input), context);
     case "read_text_file":
       return readTextFile(parseReadTextFileInput(input), context);
+    case "create_directory":
+      return createDirectory(parseCreateDirectoryInput(input), context);
     case "write_text_file":
       return writeTextFile(parseWriteTextFileInput(input), context);
     case "edit_text_file":
       return editTextFile(parseEditTextFileInput(input), context);
+    case "apply_patch": {
+      const parsed = parseApplyPatchInput(input);
+      return applyWorkspacePatch(parsed.patch, context.workspaceRoot);
+    }
     case "run_command":
       return runCommand(parseRunCommandInput(input), context);
     default:
@@ -302,6 +395,32 @@ function parseListDirectoryInput(input: unknown): ListDirectoryInput {
   }
 
   return { path: input.path };
+}
+
+function parseFindFilesInput(input: unknown): FindFilesInput {
+  if (!isRecord(input) || typeof input.path !== "string" || typeof input.pattern !== "string") {
+    throw new Error("find_files requires string path and pattern");
+  }
+  if (input.pattern.length === 0) {
+    throw new Error("find_files pattern must not be empty");
+  }
+  if (Buffer.byteLength(input.pattern, "utf8") > 1024) {
+    throw new Error("find_files pattern is too long; maximum is 1024 bytes");
+  }
+
+  const maxResults = input.max_results;
+  if (
+    maxResults !== undefined && maxResults !== null
+    && (typeof maxResults !== "number" || !Number.isInteger(maxResults) || maxResults < 1 || maxResults > MAX_FIND_RESULTS)
+  ) {
+    throw new Error(`find_files max_results must be an integer between 1 and ${MAX_FIND_RESULTS}`);
+  }
+
+  return {
+    path: input.path,
+    pattern: input.pattern,
+    maxResults: maxResults ?? DEFAULT_FIND_RESULTS,
+  };
 }
 
 function parseSearchFilesInput(input: unknown): SearchFilesInput {
@@ -347,6 +466,20 @@ function parseReadTextFileInput(input: unknown): ReadTextFileInput {
   return { path: input.path };
 }
 
+function parseCreateDirectoryInput(input: unknown): CreateDirectoryInput {
+  if (!isRecord(input) || typeof input.path !== "string") {
+    throw new Error("create_directory requires a string path");
+  }
+  if (input.path.trim().length === 0) {
+    throw new Error("create_directory path must not be empty");
+  }
+  if (Buffer.byteLength(input.path, "utf8") > 4096) {
+    throw new Error("create_directory path is too long; maximum is 4096 bytes");
+  }
+
+  return { path: input.path };
+}
+
 function parseWriteTextFileInput(input: unknown): WriteTextFileInput {
   // 写入路径和内容必须同时存在；不把 null/undefined 隐式转成字符串，
   // 否则模型参数错误可能意外覆盖文件为 "undefined"。
@@ -377,6 +510,16 @@ function parseEditTextFileInput(input: unknown): EditTextFileInput {
     oldText: input.old_text,
     newText: input.new_text,
   };
+}
+
+function parseApplyPatchInput(input: unknown): ApplyPatchInput {
+  if (!isRecord(input) || typeof input.patch !== "string") {
+    throw new Error("apply_patch requires a string patch");
+  }
+  if (input.patch.trim().length === 0) {
+    throw new Error("apply_patch patch must not be empty");
+  }
+  return { patch: input.patch };
 }
 
 // calculator 参数校验分两层：先校验 operation 是否属于枚举，再校验两个操作数是否为有限数字。
@@ -575,6 +718,20 @@ async function readTextFile(input: ReadTextFileInput, context: ToolContext): Pro
   return fs.readFile(realTarget, "utf8");
 }
 
+async function createDirectory(input: CreateDirectoryInput, context: ToolContext): Promise<string> {
+  // 先解析完整安全目标，再执行一次 mkdir。recursive 允许模型创建 a/b/c，
+  // 但路径边界、已有祖先和符号链接检查仍由工具层掌控。
+  const { root, target, existed } = await resolveWorkspaceDirectoryCreationPath(input.path, context);
+  if (!existed) {
+    await fs.mkdir(target, { recursive: true });
+  }
+
+  return JSON.stringify({
+    path: path.relative(root, target).split(path.sep).join("/") || ".",
+    created: !existed,
+  }, null, 2);
+}
+
 async function writeTextFile(input: WriteTextFileInput, context: ToolContext): Promise<string> {
   // 限制的是 UTF-8 落盘字节数，而不是 JavaScript UTF-16 string.length；
   // 这样中文、emoji 等多字节内容不会绕过文件大小上限。
@@ -688,6 +845,64 @@ interface SearchMatch {
   line: number;
   column: number;
   text: string;
+}
+
+async function findFiles(input: FindFilesInput, context: ToolContext): Promise<string> {
+  const { root, realTarget } = await resolveWorkspacePath(input.path, context);
+  const targetStat = await fs.stat(realTarget);
+  if (!targetStat.isDirectory()) {
+    throw new Error("find path is not a directory");
+  }
+
+  // 工具对外统一使用 /，这样模型给出的 glob 在 Windows 和 POSIX 上语义相同。
+  const pattern = input.pattern.replaceAll("\\", "/");
+  const patternRegex = compileFilePattern(pattern);
+  const files: string[] = [];
+  const pendingDirectories = [realTarget];
+  let scannedEntries = 0;
+  let truncated = false;
+
+  findLoop: while (pendingDirectories.length > 0) {
+    const directory = pendingDirectories.shift();
+    if (!directory) break;
+
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+
+    for (const entry of entries) {
+      scannedEntries += 1;
+      if (scannedEntries > MAX_FIND_SCANNED_ENTRIES) {
+        truncated = true;
+        break findLoop;
+      }
+
+      // 不跟随文件或目录符号链接，避免越界发现、重复结果和目录循环。
+      if (entry.isSymbolicLink()) continue;
+
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        pendingDirectories.push(entryPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      const relativePath = path.relative(root, entryPath).split(path.sep).join("/");
+      if (!patternRegex.test(relativePath)) continue;
+      if (files.length >= input.maxResults) {
+        truncated = true;
+        break findLoop;
+      }
+      files.push(relativePath);
+    }
+  }
+
+  const relativeSearchPath = path.relative(root, realTarget).split(path.sep).join("/");
+  return JSON.stringify({
+    path: relativeSearchPath.length === 0 ? "." : relativeSearchPath,
+    pattern,
+    files,
+    truncated,
+  }, null, 2);
 }
 
 async function searchFiles(input: SearchFilesInput, context: ToolContext): Promise<string> {
@@ -910,6 +1125,82 @@ async function resolveWorkspaceWritePath(
     target: path.join(realParent, path.basename(target)),
     existed: false,
   };
+}
+
+async function resolveWorkspaceDirectoryCreationPath(
+  requestedPath: string,
+  context: ToolContext,
+): Promise<{ root: string; target: string; existed: boolean }> {
+  if (path.isAbsolute(requestedPath)) {
+    throw new Error("path must be relative to the workspace");
+  }
+
+  const root = await fs.realpath(context.workspaceRoot);
+  const requestedTarget = path.resolve(root, requestedPath);
+  const relative = path.relative(root, requestedTarget);
+  if (isOutsideRoot(relative)) {
+    throw new Error("path escapes the workspace");
+  }
+
+  let targetStat: import("node:fs").Stats | undefined;
+  try {
+    // 最后一段若是符号链接，即使指向 workspace 内部也拒绝，避免“创建目录”变成操作另一个名字。
+    targetStat = await fs.lstat(requestedTarget);
+  } catch (error) {
+    if (!isFileSystemError(error, "ENOENT")) throw error;
+  }
+
+  if (targetStat) {
+    if (targetStat.isSymbolicLink()) {
+      throw new Error("directory target must not be a symbolic link");
+    }
+    if (!targetStat.isDirectory()) {
+      throw new Error("path exists and is not a directory");
+    }
+
+    const realTarget = await fs.realpath(requestedTarget);
+    const realRelative = path.relative(root, realTarget);
+    if (isOutsideRoot(realRelative)) {
+      throw new Error("path resolves outside the workspace");
+    }
+    return { root, target: realTarget, existed: true };
+  }
+
+  // recursive mkdir 的直接父目录也可能不存在，因此向上寻找最近的已有祖先，
+  // 再验证祖先真实路径并从该真实路径拼回所有缺失目录。
+  const missingSegments = [path.basename(requestedTarget)];
+  let existingAncestor = path.dirname(requestedTarget);
+  let ancestorStat: import("node:fs").Stats;
+  while (true) {
+    try {
+      ancestorStat = await fs.stat(existingAncestor);
+      break;
+    } catch (error) {
+      if (!isFileSystemError(error, "ENOENT")) throw error;
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) {
+        throw new Error("could not find an existing parent directory");
+      }
+      missingSegments.push(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+
+  if (!ancestorStat.isDirectory()) {
+    throw new Error("parent path is not a directory");
+  }
+  const realAncestor = await fs.realpath(existingAncestor);
+  const ancestorRelative = path.relative(root, realAncestor);
+  if (isOutsideRoot(ancestorRelative)) {
+    throw new Error("path resolves outside the workspace");
+  }
+
+  const target = path.join(realAncestor, ...missingSegments.reverse());
+  const targetRelative = path.relative(root, target);
+  if (isOutsideRoot(targetRelative)) {
+    throw new Error("path resolves outside the workspace");
+  }
+  return { root, target, existed: false };
 }
 
 function isOutsideRoot(relativePath: string): boolean {

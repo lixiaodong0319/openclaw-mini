@@ -10,13 +10,16 @@
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
-- 七个最小工具：
+- 十个最小工具：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
+  - `find_files`：按 glob 递归查找 `workspace/` 内的文件路径
   - `search_files`：递归搜索 `workspace/` 内的文本内容
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
+  - `create_directory`：确认后递归创建 `workspace/` 内的目录
   - `write_text_file`：确认后创建或覆盖 `workspace/` 内的 UTF-8 文本文件
   - `edit_text_file`：确认后精确替换现有文本文件中的唯一内容块
+  - `apply_patch`：确认后用统一补丁新增或更新一个或多个文件
   - `run_command`：确认后从 `workspace/` 启动 Shell 命令，用于构建、测试和代码检查
 - JSONL 会话持久化，支持重启后继续同一 session
 - 长会话自动摘要压缩，保留最近完整轮次和工具调用链
@@ -36,6 +39,7 @@
 
 ```text
 src/
+  apply-patch.ts     多文件补丁解析、预检和应用逻辑
   agent-loop.ts      厂商无关的统一 Agent Loop
   cli.ts             本地命令行入口
   context-compaction.ts 上下文估算、压缩阈值和保留策略
@@ -50,6 +54,7 @@ src/
 
 test/
   agent-loop.test.ts     Agent Loop 测试
+  apply-patch.test.ts    多文件补丁和安全边界测试
   openai-adapter.test.ts OpenAI 适配器测试
   openai-provider.test.ts OpenAI HTTP Provider 测试
   fake-provider.ts       测试用 Fake Provider
@@ -164,7 +169,7 @@ workspace 中包含 note.txt。
 [会话] 上下文压缩完成（32840 → 6210 tokens）
 ```
 
-`calculator`、`list_directory`、`search_files` 和 `read_text_file` 是无副作用工具，会自动执行。`write_text_file`、`edit_text_file` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
+`calculator`、`list_directory`、`find_files`、`search_files` 和 `read_text_file` 是无副作用工具，会自动执行。`create_directory`、`write_text_file`、`edit_text_file`、`apply_patch` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
 
 ```text
 [工具] write_text_file 等待确认
@@ -225,14 +230,19 @@ pnpm dev -- --session demo
 
 ```text
 > 查看 workspace 里有哪些文件
+> 找到所有 TypeScript 测试文件
 > 在所有 TypeScript 文件中搜索 OPENAI_API_KEY
 > 读取 note.txt 并总结内容
+> 创建 src/components 目录
 > 创建 hello.txt，内容是 Hello World
 > 把 config.txt 中的 port=3000 改成 port=8080
+> 用一个补丁同时修改 config.txt 和 README.md
 > 运行 pnpm test 并分析失败原因
 ```
 
-`list_directory`、`search_files`、`read_text_file`、`write_text_file` 和 `edit_text_file` 只能访问 `workspace/`。访问 `../`、绝对路径或通过符号链接逃逸到 workspace 外都会被拒绝。目录浏览每次只返回一层，最多返回 200 项；文本搜索会递归扫描，支持 `**/*.ts` 形式的文件过滤，默认最多返回 50 条、最高 200 条匹配；文本读写上限为 1 MiB。写入新文件时，父目录必须已存在。精确编辑只有在 `old_text` 唯一匹配时才会执行。
+`list_directory`、`find_files`、`search_files`、`read_text_file`、`create_directory`、`write_text_file`、`edit_text_file` 和 `apply_patch` 只能访问 `workspace/`。访问 `../`、绝对路径或通过符号链接逃逸到 workspace 外都会被拒绝。目录浏览每次只返回一层，最多返回 200 项；文件查找支持 `*`、`**` 和 `?`，默认最多返回 100 条、最高 500 条路径；文本搜索会递归扫描，支持 `**/*.ts` 形式的文件过滤，默认最多返回 50 条、最高 200 条匹配；目录创建会递归补齐缺失的父目录，目标已存在时安全返回；文本读写上限为 1 MiB。写入新文件时，父目录必须已存在。精确编辑只有在 `old_text` 唯一匹配时才会执行。
+
+`apply_patch` 使用 `*** Begin Patch` / `*** End Patch` 格式，支持 `*** Add File:` 和 `*** Update File:`，同一更新文件可以包含多个 `@@` hunk。第一版不支持删除文件；新增文件的父目录必须已经存在。所有路径和 hunk 会在写盘前统一校验，任一上下文缺失或重复时整批拒绝。单个补丁和每个补丁结果文件最大均为 1 MiB。
 
 `run_command` 固定从 `workspace/` 启动，但这只是初始工作目录，并不是文件系统沙箱：Shell 命令仍可能通过绝对路径或 `..` 访问 workspace 外部。因此该工具不会自动放行，每次调用都必须人工确认。子进程不接收交互式 stdin；默认超时 30 秒，最长可配置为 120 秒；stdout 和 stderr 各最多返回 64 KiB，超出部分会标记为截断。常见的 Key、Token、Password、Cookie、Session 等敏感环境变量不会传给子进程。
 
@@ -259,7 +269,7 @@ pnpm test         运行测试
 
 ## 安全边界
 
-当前版本暴露四个自动放行工具，以及两个文本修改工具和一个每次都需确认的 Shell 工具。模型无法访问浏览器；文件工具无法读写 workspace 外文件。
+当前版本暴露五个自动放行工具，以及一个目录创建工具、三个文件修改工具和一个每次都需确认的 Shell 工具。模型无法访问浏览器；文件工具无法读写 workspace 外文件。
 
 工具权限采用安全默认值：已登记的纯计算和只读工具自动放行，所有未登记工具都必须经过用户确认。拒绝后不会调用工具实现，而是把拒绝结果回填给模型，让模型继续回复。
 
@@ -295,13 +305,16 @@ pnpm run build
 - 单工具调用
 - 多工具并行调用
 - 目录浏览、排序、非递归和数量上限
+- 文件递归查找、glob 过滤、结果上限和路径边界
 - 文本递归搜索、glob 过滤、结果上限和路径边界
 - 工具错误转为 `tool_result` 错误
 - OpenAI reasoning item 回放和 `function_call_output`
 - refusal 和迭代上限
 - workspace 文件读取边界
+- workspace 目录递归创建、幂等结果和路径边界
 - workspace 文件创建、覆盖、大小上限和写入边界
 - workspace 文件唯一内容块替换及零匹配、多匹配保护
+- 多文件补丁、新增文件、多 hunk、换行保留、预检失败零落盘和路径边界
 - Shell 命令的工作目录、退出码、超时、输出截断和敏感环境变量清理
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic/OpenAI 会话历史统一展示与内部数据过滤

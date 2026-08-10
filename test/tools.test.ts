@@ -24,6 +24,65 @@ describe("tools", () => {
     await expect(executeTool("read_text_file", { path: path.resolve(workspaceRoot, "note.txt") }, { workspaceRoot })).rejects.toThrow("relative");
   });
 
+  it("creates nested directories inside the workspace", async () => {
+    const result = await executeTool(
+      "create_directory",
+      { path: "src/components" },
+      { workspaceRoot },
+    );
+
+    expect(JSON.parse(result)).toEqual({
+      path: "src/components",
+      created: true,
+    });
+    expect((await fs.stat(path.join(workspaceRoot, "src", "components"))).isDirectory()).toBe(true);
+  });
+
+  it("treats creating an existing directory as an idempotent success", async () => {
+    await fs.mkdir(path.join(workspaceRoot, "docs"));
+
+    const result = await executeTool("create_directory", { path: "docs" }, { workspaceRoot });
+
+    expect(JSON.parse(result)).toEqual({ path: "docs", created: false });
+  });
+
+  it("rejects invalid directory creation paths", async () => {
+    await expect(executeTool("create_directory", { path: "../outside" }, { workspaceRoot }))
+      .rejects.toThrow("workspace");
+    await expect(executeTool(
+      "create_directory",
+      { path: path.resolve(workspaceRoot, "absolute") },
+      { workspaceRoot },
+    )).rejects.toThrow("relative");
+    await expect(executeTool("create_directory", { path: "   " }, { workspaceRoot }))
+      .rejects.toThrow("must not be empty");
+  });
+
+  it("rejects files used as directory targets or parents", async () => {
+    await fs.writeFile(path.join(workspaceRoot, "note.txt"), "hello", "utf8");
+
+    await expect(executeTool("create_directory", { path: "note.txt" }, { workspaceRoot }))
+      .rejects.toThrow("not a directory");
+    await expect(executeTool("create_directory", { path: "note.txt/nested" }, { workspaceRoot }))
+      .rejects.toThrow("not a directory");
+  });
+
+  it.skipIf(process.platform === "win32")("rejects directory creation through escaping symbolic links", async () => {
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-outside-directory-"));
+    try {
+      await fs.symlink(outsideRoot, path.join(workspaceRoot, "linked"));
+
+      await expect(executeTool(
+        "create_directory",
+        { path: "linked/nested" },
+        { workspaceRoot },
+      )).rejects.toThrow("outside the workspace");
+      await expect(fs.stat(path.join(outsideRoot, "nested"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(outsideRoot, { recursive: true, force: true });
+    }
+  });
+
   it("creates UTF-8 text files inside the workspace", async () => {
     const result = await executeTool(
       "write_text_file",
@@ -230,6 +289,89 @@ describe("tools", () => {
 
     expect(output.entries).toHaveLength(200);
     expect(output.truncated).toBe(true);
+  });
+
+  it("finds workspace files recursively by glob", async () => {
+    await fs.mkdir(path.join(workspaceRoot, "nested"));
+    await fs.writeFile(path.join(workspaceRoot, "root.test.ts"), "", "utf8");
+    await fs.writeFile(path.join(workspaceRoot, "nested", "agent.test.ts"), "", "utf8");
+    await fs.writeFile(path.join(workspaceRoot, "nested", "agent.ts"), "", "utf8");
+
+    const output = JSON.parse(await executeTool(
+      "find_files",
+      { path: ".", pattern: "**/*.test.ts", max_results: null },
+      { workspaceRoot },
+    ));
+
+    expect(output).toEqual({
+      path: ".",
+      pattern: "**/*.test.ts",
+      files: ["root.test.ts", "nested/agent.test.ts"],
+      truncated: false,
+    });
+  });
+
+  it("scopes file discovery to the requested directory", async () => {
+    await fs.mkdir(path.join(workspaceRoot, "src", "nested"), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, "outside.ts"), "", "utf8");
+    await fs.writeFile(path.join(workspaceRoot, "src", "index.ts"), "", "utf8");
+    await fs.writeFile(path.join(workspaceRoot, "src", "nested", "config.ts"), "", "utf8");
+
+    const output = JSON.parse(await executeTool(
+      "find_files",
+      { path: "src", pattern: "**/*.ts", max_results: 10 },
+      { workspaceRoot },
+    )) as { path: string; files: string[] };
+
+    expect(output.path).toBe("src");
+    expect(output.files).toEqual(["src/index.ts", "src/nested/config.ts"]);
+  });
+
+  it("limits discovered files and reports truncation", async () => {
+    await Promise.all(["a.ts", "b.ts", "c.ts"].map((name) =>
+      fs.writeFile(path.join(workspaceRoot, name), "", "utf8")
+    ));
+
+    const output = JSON.parse(await executeTool(
+      "find_files",
+      { path: ".", pattern: "*.ts", max_results: 2 },
+      { workspaceRoot },
+    )) as { files: string[]; truncated: boolean };
+
+    expect(output.files).toEqual(["a.ts", "b.ts"]);
+    expect(output.truncated).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("does not follow symbolic links while finding files", async () => {
+    await fs.mkdir(path.join(workspaceRoot, "real"));
+    await fs.writeFile(path.join(workspaceRoot, "real", "note.txt"), "", "utf8");
+    await fs.symlink(path.join(workspaceRoot, "real"), path.join(workspaceRoot, "linked"));
+
+    const output = JSON.parse(await executeTool(
+      "find_files",
+      { path: ".", pattern: "**/*.txt", max_results: null },
+      { workspaceRoot },
+    )) as { files: string[] };
+
+    expect(output.files).toEqual(["real/note.txt"]);
+  });
+
+  it("validates file discovery paths, patterns, and limits", async () => {
+    await expect(executeTool(
+      "find_files",
+      { path: "..", pattern: "**/*", max_results: null },
+      { workspaceRoot },
+    )).rejects.toThrow("workspace");
+    await expect(executeTool(
+      "find_files",
+      { path: ".", pattern: "", max_results: null },
+      { workspaceRoot },
+    )).rejects.toThrow("must not be empty");
+    await expect(executeTool(
+      "find_files",
+      { path: ".", pattern: "**/*", max_results: 501 },
+      { workspaceRoot },
+    )).rejects.toThrow("between 1 and 500");
   });
 
   it("searches text files recursively with line and column locations", async () => {
@@ -466,10 +608,13 @@ describe("tools", () => {
   it("requires confirmation by default except for registered safe tools", () => {
     expect(requiresToolConfirmation("calculator")).toBe(false);
     expect(requiresToolConfirmation("list_directory")).toBe(false);
+    expect(requiresToolConfirmation("find_files")).toBe(false);
     expect(requiresToolConfirmation("search_files")).toBe(false);
     expect(requiresToolConfirmation("read_text_file")).toBe(false);
+    expect(requiresToolConfirmation("create_directory")).toBe(true);
     expect(requiresToolConfirmation("write_text_file")).toBe(true);
     expect(requiresToolConfirmation("edit_text_file")).toBe(true);
+    expect(requiresToolConfirmation("apply_patch")).toBe(true);
     expect(requiresToolConfirmation("run_command")).toBe(true);
     expect(requiresToolConfirmation("shell")).toBe(true);
   });
