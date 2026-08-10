@@ -10,12 +10,14 @@
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
-- 十个最小工具：
+- 十二个最小工具：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
   - `find_files`：按 glob 递归查找 `workspace/` 内的文件路径
   - `search_files`：递归搜索 `workspace/` 内的文本内容
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
+  - `git_status`：查看 `workspace/` 内 Git 仓库的分支和文件状态
+  - `git_diff`：查看 `workspace/` 内 Git 仓库的暂存或未暂存差异
   - `create_directory`：确认后递归创建 `workspace/` 内的目录
   - `write_text_file`：确认后创建或覆盖 `workspace/` 内的 UTF-8 文本文件
   - `edit_text_file`：确认后精确替换现有文本文件中的唯一内容块
@@ -43,6 +45,7 @@ src/
   agent-loop.ts      厂商无关的统一 Agent Loop
   cli.ts             本地命令行入口
   context-compaction.ts 上下文估算、压缩阈值和保留策略
+  git-tools.ts       只读 Git 状态、差异和进程安全边界
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
   session-history.ts 两种 Provider 原生历史到安全展示视图的转换
@@ -58,6 +61,7 @@ test/
   openai-adapter.test.ts OpenAI 适配器测试
   openai-provider.test.ts OpenAI HTTP Provider 测试
   fake-provider.ts       测试用 Fake Provider
+  git-tools.test.ts      临时 Git 仓库与只读边界测试
   session-store.test.ts  会话存储测试
   session-history.test.ts 会话历史展示转换测试
   tools.test.ts          工具边界测试
@@ -169,7 +173,7 @@ workspace 中包含 note.txt。
 [会话] 上下文压缩完成（32840 → 6210 tokens）
 ```
 
-`calculator`、`list_directory`、`find_files`、`search_files` 和 `read_text_file` 是无副作用工具，会自动执行。`create_directory`、`write_text_file`、`edit_text_file`、`apply_patch` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
+`calculator`、`list_directory`、`find_files`、`search_files`、`read_text_file`、`git_status` 和 `git_diff` 是无副作用工具，会自动执行。`create_directory`、`write_text_file`、`edit_text_file`、`apply_patch` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
 
 ```text
 [工具] write_text_file 等待确认
@@ -237,12 +241,15 @@ pnpm dev -- --session demo
 > 创建 hello.txt，内容是 Hello World
 > 把 config.txt 中的 port=3000 改成 port=8080
 > 用一个补丁同时修改 config.txt 和 README.md
+> 查看当前 Git 状态和 src/tools.ts 的未暂存差异
 > 运行 pnpm test 并分析失败原因
 ```
 
 `list_directory`、`find_files`、`search_files`、`read_text_file`、`create_directory`、`write_text_file`、`edit_text_file` 和 `apply_patch` 只能访问 `workspace/`。访问 `../`、绝对路径或通过符号链接逃逸到 workspace 外都会被拒绝。目录浏览每次只返回一层，最多返回 200 项；文件查找支持 `*`、`**` 和 `?`，默认最多返回 100 条、最高 500 条路径；文本搜索会递归扫描，支持 `**/*.ts` 形式的文件过滤，默认最多返回 50 条、最高 200 条匹配；目录创建会递归补齐缺失的父目录，目标已存在时安全返回；文本读写上限为 1 MiB。写入新文件时，父目录必须已存在。精确编辑只有在 `old_text` 唯一匹配时才会执行。
 
 `apply_patch` 使用 `*** Begin Patch` / `*** End Patch` 格式，支持 `*** Add File:` 和 `*** Update File:`，同一更新文件可以包含多个 `@@` hunk。第一版不支持删除文件；新增文件的父目录必须已经存在。所有路径和 hunk 会在写盘前统一校验，任一上下文缺失或重复时整批拒绝。单个补丁和每个补丁结果文件最大均为 1 MiB。
+
+`git_status` 和 `git_diff` 只允许检查顶层目录位于 `workspace/` 内的非裸 Git 仓库。它们直接启动 Git 而不经过 Shell，并关闭 pager、外部 diff、textconv、fsmonitor、全局/系统配置和可选索引写锁。`git_diff` 默认最多返回 64 KiB，最高可请求 256 KiB；可指定一个仓库相对文件，也可查看全部暂存或未暂存差异。
 
 `run_command` 固定从 `workspace/` 启动，但这只是初始工作目录，并不是文件系统沙箱：Shell 命令仍可能通过绝对路径或 `..` 访问 workspace 外部。因此该工具不会自动放行，每次调用都必须人工确认。子进程不接收交互式 stdin；默认超时 30 秒，最长可配置为 120 秒；stdout 和 stderr 各最多返回 64 KiB，超出部分会标记为截断。常见的 Key、Token、Password、Cookie、Session 等敏感环境变量不会传给子进程。
 
@@ -269,7 +276,7 @@ pnpm test         运行测试
 
 ## 安全边界
 
-当前版本暴露五个自动放行工具，以及一个目录创建工具、三个文件修改工具和一个每次都需确认的 Shell 工具。模型无法访问浏览器；文件工具无法读写 workspace 外文件。
+当前版本暴露七个自动放行工具，以及一个目录创建工具、三个文件修改工具和一个每次都需确认的 Shell 工具。模型无法访问浏览器；文件工具无法读写 workspace 外文件。
 
 工具权限采用安全默认值：已登记的纯计算和只读工具自动放行，所有未登记工具都必须经过用户确认。拒绝后不会调用工具实现，而是把拒绝结果回填给模型，让模型继续回复。
 
@@ -315,6 +322,7 @@ pnpm run build
 - workspace 文件创建、覆盖、大小上限和写入边界
 - workspace 文件唯一内容块替换及零匹配、多匹配保护
 - 多文件补丁、新增文件、多 hunk、换行保留、预检失败零落盘和路径边界
+- Git 分支/文件状态、暂存/未暂存差异、UTF-8 截断和仓库边界
 - Shell 命令的工作目录、退出码、超时、输出截断和敏感环境变量清理
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic/OpenAI 会话历史统一展示与内部数据过滤

@@ -3,6 +3,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { applyWorkspacePatch } from "./apply-patch.js";
+import {
+  DEFAULT_GIT_DIFF_BYTES,
+  getGitDiff,
+  getGitStatus,
+  MAX_GIT_DIFF_BYTES,
+} from "./git-tools.js";
 
 // 直接复用 SDK 的 Tool 类型，确保工具定义形状和 Anthropic SDK 保持一致。
 // 不额外声明自定义 Tool interface，可以避免 SDK 升级后字段含义或类型漂移。
@@ -80,6 +86,17 @@ interface SearchFilesInput {
   maxResults: number;
 }
 
+interface GitStatusInput {
+  path: string;
+}
+
+interface GitDiffInput {
+  path: string;
+  file?: string;
+  staged: boolean;
+  maxBytes: number;
+}
+
 // calculator 的模型输入结构。
 // operation 使用联合类型限定四则运算，避免接收表达式字符串后被迫 eval。
 interface CalculatorInput {
@@ -123,9 +140,17 @@ const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 // 这不是 Shell 沙箱，而是防止 `env` 等普通命令直接暴露 API Key 的额外防线。
 const SENSITIVE_ENVIRONMENT_NAME = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|AUTHORIZATION|COOKIE|SESSION|JWT)(?:_|$)/i;
 
-// 当前五个工具都是只读或纯计算能力，可以直接执行。
+// 当前七个工具都是只读或纯计算能力，可以直接执行。
 // 未登记的新工具默认需要用户确认，避免未来加入写文件、Shell 等能力时意外绕过审批。
-const AUTO_APPROVED_TOOLS = new Set(["calculator", "list_directory", "find_files", "search_files", "read_text_file"]);
+const AUTO_APPROVED_TOOLS = new Set([
+  "calculator",
+  "list_directory",
+  "find_files",
+  "search_files",
+  "read_text_file",
+  "git_status",
+  "git_diff",
+]);
 
 export function requiresToolConfirmation(name: string): boolean {
   return !AUTO_APPROVED_TOOLS.has(name);
@@ -244,6 +269,54 @@ export const toolDefinitions: ToolDefinition[] = [
         },
       },
       required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "git_status",
+    description: "Call this to inspect the branch and changed files of a Git repository inside the workspace. This is read-only and returns structured porcelain status without running a shell.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Workspace-relative path inside the Git repository. Use '.' when the workspace root is the repository.",
+        },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "git_diff",
+    description: "Call this to inspect staged or unstaged Git changes inside a workspace repository. External diff programs and text conversion are disabled. This tool is read-only.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Workspace-relative path inside the Git repository. Use '.' when the workspace root is the repository.",
+        },
+        file: {
+          anyOf: [{ type: "string" }, { type: "null" }],
+          description: "Repository-relative file path to inspect, or null for all changed files.",
+        },
+        staged: {
+          type: "boolean",
+          description: "Use true for staged changes and false for unstaged changes.",
+        },
+        max_bytes: {
+          anyOf: [
+            { type: "integer", minimum: 1, maximum: MAX_GIT_DIFF_BYTES },
+            { type: "null" },
+          ],
+          description: `Maximum diff bytes to return. Use null for the default of ${DEFAULT_GIT_DIFF_BYTES}.`,
+        },
+      },
+      // nullable 字段仍放进 required，满足 OpenAI strict function schema。
+      required: ["path", "file", "staged", "max_bytes"],
       additionalProperties: false,
     },
   },
@@ -370,6 +443,19 @@ export async function executeTool(
       return searchFiles(parseSearchFilesInput(input), context);
     case "read_text_file":
       return readTextFile(parseReadTextFileInput(input), context);
+    case "git_status": {
+      const parsed = parseGitStatusInput(input);
+      return getGitStatus(context.workspaceRoot, parsed.path);
+    }
+    case "git_diff": {
+      const parsed = parseGitDiffInput(input);
+      return getGitDiff(context.workspaceRoot, {
+        repositoryPath: parsed.path,
+        file: parsed.file,
+        staged: parsed.staged,
+        maxBytes: parsed.maxBytes,
+      });
+    }
     case "create_directory":
       return createDirectory(parseCreateDirectoryInput(input), context);
     case "write_text_file":
@@ -464,6 +550,39 @@ function parseReadTextFileInput(input: unknown): ReadTextFileInput {
   }
 
   return { path: input.path };
+}
+
+function parseGitStatusInput(input: unknown): GitStatusInput {
+  if (!isRecord(input) || typeof input.path !== "string") {
+    throw new Error("git_status requires a string path");
+  }
+  return { path: input.path };
+}
+
+function parseGitDiffInput(input: unknown): GitDiffInput {
+  if (!isRecord(input) || typeof input.path !== "string" || typeof input.staged !== "boolean") {
+    throw new Error("git_diff requires string path and boolean staged");
+  }
+  const file = input.file;
+  if (file !== undefined && file !== null && (typeof file !== "string" || file.trim().length === 0)) {
+    throw new Error("git_diff file must be a non-empty string or null");
+  }
+  if (typeof file === "string" && Buffer.byteLength(file, "utf8") > 4096) {
+    throw new Error("git_diff file is too long; maximum is 4096 bytes");
+  }
+  const maxBytes = input.max_bytes;
+  if (
+    maxBytes !== undefined && maxBytes !== null
+    && (typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_GIT_DIFF_BYTES)
+  ) {
+    throw new Error(`git_diff max_bytes must be an integer between 1 and ${MAX_GIT_DIFF_BYTES}`);
+  }
+  return {
+    path: input.path,
+    file: file ?? undefined,
+    staged: input.staged,
+    maxBytes: maxBytes ?? DEFAULT_GIT_DIFF_BYTES,
+  };
 }
 
 function parseCreateDirectoryInput(input: unknown): CreateDirectoryInput {

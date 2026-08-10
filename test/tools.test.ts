@@ -611,6 +611,8 @@ describe("tools", () => {
     expect(requiresToolConfirmation("find_files")).toBe(false);
     expect(requiresToolConfirmation("search_files")).toBe(false);
     expect(requiresToolConfirmation("read_text_file")).toBe(false);
+    expect(requiresToolConfirmation("git_status")).toBe(false);
+    expect(requiresToolConfirmation("git_diff")).toBe(false);
     expect(requiresToolConfirmation("create_directory")).toBe(true);
     expect(requiresToolConfirmation("write_text_file")).toBe(true);
     expect(requiresToolConfirmation("edit_text_file")).toBe(true);
