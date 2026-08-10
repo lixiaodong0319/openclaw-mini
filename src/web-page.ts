@@ -33,6 +33,7 @@ export const WEB_PAGE = String.raw`<!doctype html>
     const sendElement = document.querySelector("#send");
     const newSessionElement = document.querySelector("#new-session");
     let assistantOutput = null;
+    let historyLoadVersion = 0;
 
     function appendMessage(label, text) {
       const container = document.createElement("section");
@@ -48,6 +49,40 @@ export const WEB_PAGE = String.raw`<!doctype html>
     function appendAssistantText(text) {
       if (!assistantOutput) assistantOutput = appendMessage("助手", "").content;
       assistantOutput.textContent += text;
+    }
+
+    function resetMessages() {
+      messagesElement.replaceChildren();
+      assistantOutput = null;
+    }
+
+    function renderHistoryEntry(entry) {
+      if (entry.type === "message") {
+        appendMessage(entry.role === "user" ? "你" : "助手", entry.text);
+        return;
+      }
+      if (entry.type === "summary") {
+        appendMessage("早期会话摘要", entry.text);
+        return;
+      }
+      if (entry.type === "tool") {
+        const status = entry.status === "completed"
+          ? "完成"
+          : entry.status === "failed" ? "失败" : "等待结果";
+        appendMessage("历史工具", "[工具] " + entry.name + " " + status);
+      }
+    }
+
+    async function loadHistory(sessionId) {
+      const version = ++historyLoadVersion;
+      resetMessages();
+      const response = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/history");
+      if (!response.ok) throw new Error("无法读取 Session 历史");
+      const history = await response.json();
+      // 用户可能在请求返回前又切换了 Session，旧响应不能覆盖新页面。
+      if (version !== historyLoadVersion || sessionElement.value !== sessionId) return;
+      if (history.truncated) appendMessage("提示", "历史较长，仅展示最近 200 项。");
+      history.entries.forEach(renderHistoryEntry);
     }
 
     function addSession(sessionId) {
@@ -73,6 +108,7 @@ export const WEB_PAGE = String.raw`<!doctype html>
       if ([...sessionElement.options].some((option) => option.value === "default")) {
         sessionElement.value = "default";
       }
+      await loadHistory(sessionElement.value);
     }
 
     newSessionElement.addEventListener("click", () => {
@@ -84,12 +120,12 @@ export const WEB_PAGE = String.raw`<!doctype html>
       }
       addSession(sessionId);
       sessionElement.value = sessionId;
-      messagesElement.replaceChildren();
+      historyLoadVersion += 1;
+      resetMessages();
     });
 
     sessionElement.addEventListener("change", () => {
-      messagesElement.replaceChildren();
-      assistantOutput = null;
+      loadHistory(sessionElement.value).catch(showError);
     });
 
     function describeAgentEvent(event) {
@@ -182,6 +218,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
       const sessionId = sessionElement.value;
       const message = messageElement.value.trim();
       if (!sessionId || !message) return;
+      // 发送消息后以当前页面为准，取消仍在途的历史回放响应。
+      historyLoadVersion += 1;
       addSession(sessionId);
       appendMessage("你", message);
       assistantOutput = null;

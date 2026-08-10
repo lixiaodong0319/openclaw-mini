@@ -12,6 +12,12 @@ const config: RuntimeConfig = {
   model: "test-model",
 };
 
+const emptyHistory = async (sessionId: string) => ({
+  sessionId,
+  entries: [],
+  truncated: false,
+});
+
 type AgentRunner = Pick<AgentLoop, "runTurn">;
 
 class SseReader {
@@ -91,6 +97,11 @@ describe("Web server", () => {
       config,
       getAgent: async () => createRunner(async () => ({ text: "", stopReason: "done" })),
       listSessions: async () => ["default", "demo"],
+      loadHistory: async (sessionId) => ({
+        sessionId,
+        entries: [{ type: "message", role: "user", text: "old question" }],
+        truncated: false,
+      }),
       page: "<h1>test page</h1>",
     });
     servers.push(server);
@@ -106,6 +117,12 @@ describe("Web server", () => {
     await expect(fetch(`${baseUrl}/api/sessions`).then((response) => response.json())).resolves.toEqual({
       sessions: ["default", "demo"],
     });
+    await expect(fetch(`${baseUrl}/api/sessions/demo/history`).then((response) => response.json()))
+      .resolves.toEqual({
+        sessionId: "demo",
+        entries: [{ type: "message", role: "user", text: "old question" }],
+        truncated: false,
+      });
   });
 
   it("streams agent text and completion as SSE", async () => {
@@ -119,6 +136,7 @@ describe("Web server", () => {
       config,
       getAgent: async () => agent,
       listSessions: async () => [],
+      loadHistory: emptyHistory,
     });
     servers.push(server);
     const baseUrl = await listen(server);
@@ -159,6 +177,7 @@ describe("Web server", () => {
       config,
       getAgent: async () => agent,
       listSessions: async () => [],
+      loadHistory: emptyHistory,
     });
     servers.push(server);
     const baseUrl = await listen(server);
@@ -205,6 +224,7 @@ describe("Web server", () => {
       config,
       getAgent: async () => createRunner(async () => ({ text: "", stopReason: "done" })),
       listSessions: async () => [],
+      loadHistory: emptyHistory,
     });
     servers.push(server);
     const baseUrl = await listen(server);

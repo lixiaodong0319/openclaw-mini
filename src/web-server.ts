@@ -7,6 +7,7 @@ import type {
 } from "./agent-loop.js";
 import type { RuntimeConfig } from "./runtime.js";
 import { formatRuntimeError } from "./runtime.js";
+import type { SessionHistoryView } from "./session-history.js";
 import { WEB_PAGE } from "./web-page.js";
 
 type AgentRunner = Pick<AgentLoop, "runTurn">;
@@ -15,6 +16,7 @@ export interface WebServerOptions {
   config: RuntimeConfig;
   getAgent: (sessionId: string) => Promise<AgentRunner>;
   listSessions: () => Promise<string[]>;
+  loadHistory: (sessionId: string) => Promise<SessionHistoryView>;
   confirmationTimeoutMs?: number;
   page?: string;
 }
@@ -91,6 +93,15 @@ async function routeRequest(
   if (request.method === "GET" && url.pathname === "/api/sessions") {
     writeJson(response, 200, { sessions: await options.listSessions() });
     return;
+  }
+
+  if (request.method === "GET") {
+    const historyMatch = /^\/api\/sessions\/([^/]+)\/history$/.exec(url.pathname);
+    if (historyMatch) {
+      const sessionId = requireSessionId(decodePathSegment(historyMatch[1] ?? ""));
+      writeJson(response, 200, await options.loadHistory(sessionId));
+      return;
+    }
   }
 
   if (request.method === "POST" && url.pathname === "/api/chat") {
@@ -255,6 +266,14 @@ function requireMessage(value: unknown): string {
     throw new HttpError(400, "message must not exceed 32768 bytes");
   }
   return value;
+}
+
+function decodePathSegment(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new HttpError(400, "sessionId path encoding is invalid");
+  }
 }
 
 function writeJson(response: ServerResponse, status: number, body: unknown): void {

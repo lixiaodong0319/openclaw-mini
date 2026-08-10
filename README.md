@@ -5,7 +5,7 @@
 ## 功能
 
 - 本地命令行 REPL 对话
-- 本地 Web 对话，可选择或新建 Session
+- 本地 Web 对话，可选择、新建并回放 Session 历史
 - 模型文本流式输出，显示工具确认、执行中、完成和失败状态
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
@@ -40,6 +40,7 @@ src/
   context-compaction.ts 上下文估算、压缩阈值和保留策略
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
+  session-history.ts 两种 Provider 原生历史到安全展示视图的转换
   session-store.ts   JSONL 会话存储
   tools.ts           工具定义与执行逻辑
   web.ts             本地 Web 服务入口
@@ -52,6 +53,7 @@ test/
   openai-provider.test.ts OpenAI HTTP Provider 测试
   fake-provider.ts       测试用 Fake Provider
   session-store.test.ts  会话存储测试
+  session-history.test.ts 会话历史展示转换测试
   tools.test.ts          工具边界测试
   web-server.test.ts     Web、SSE 和浏览器确认测试
 
@@ -189,7 +191,9 @@ pnpm web
 http://127.0.0.1:3000
 ```
 
-页面会显示当前 Provider、模型和 workspace，可以选择已有 Session 或新建 Session。模型回复通过 POST 请求的 SSE 响应流式显示；遇到受保护工具时，当前轮次会暂停，只有点击“允许”或“拒绝”后才会继续。切换 Session 会清空当前页面显示，但服务端仍会加载对应 JSONL 历史并继续上下文。
+页面会显示当前 Provider、模型和 workspace，可以选择已有 Session 或新建 Session。模型回复通过 POST 请求的 SSE 响应流式显示；遇到受保护工具时，当前轮次会暂停，只有点击“允许”或“拒绝”后才会继续。刷新页面或切换 Session 时，会从对应 JSONL 回放用户消息、助手回复、压缩摘要和工具完成状态。
+
+历史接口不会把 Provider 原生数据直接发给浏览器：OpenAI reasoning、Anthropic thinking、工具参数和工具输出都会过滤。页面最多回放 200 项；历史更长时保留压缩摘要并优先展示最近内容。
 
 监听地址和端口可以配置：
 
@@ -297,6 +301,7 @@ pnpm run build
 - workspace 文件唯一内容块替换及零匹配、多匹配保护
 - Shell 命令的工作目录、退出码、超时、输出截断和敏感环境变量清理
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
+- Anthropic/OpenAI 会话历史统一展示与内部数据过滤
 - Anthropic 和 OpenAI 历史摘要压缩与最近工具链保留
 - 压缩后 JSONL 历史原子替换
 - 旧 Anthropic 会话向独立目录的无覆盖迁移
@@ -306,4 +311,4 @@ pnpm run build
 
 这个项目适合作为最小 Agent Loop 学习样例。后续如果要继续扩展，建议按顺序增加：
 
-1. 在 Web UI 中回放已有 Session 的对话历史
+1. 在 Web UI 中重命名和删除 Session

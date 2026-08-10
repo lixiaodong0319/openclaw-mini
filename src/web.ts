@@ -7,6 +7,7 @@ import {
   resolveRuntimeConfig,
 } from "./runtime.js";
 import { listSessionIds } from "./session-store.js";
+import { loadSessionHistory } from "./session-history.js";
 import { createWebServer } from "./web-server.js";
 
 async function main(): Promise<void> {
@@ -33,6 +34,7 @@ async function main(): Promise<void> {
       config.dataRoot,
       config.providerName,
     ),
+    loadHistory: (sessionId) => loadSessionHistory(config, sessionId),
   });
   const port = readPositiveIntegerEnvironment("OPENCLAW_WEB_PORT", 3000);
   if (port > 65_535) throw new Error("OPENCLAW_WEB_PORT must not exceed 65535");
