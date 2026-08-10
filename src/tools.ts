@@ -51,6 +51,15 @@ interface ListDirectoryInput {
   path: string;
 }
 
+// search_files 在指定目录下递归搜索文本内容。
+// query 按字面量匹配，不作为正则表达式执行；filePattern 只用于过滤文件路径。
+interface SearchFilesInput {
+  query: string;
+  path: string;
+  filePattern?: string;
+  maxResults: number;
+}
+
 // calculator 的模型输入结构。
 // operation 使用联合类型限定四则运算，避免接收表达式字符串后被迫 eval。
 interface CalculatorInput {
@@ -71,6 +80,13 @@ const MAX_FILE_BYTES = 1024 * 1024;
 // 限制单次目录列表的规模，防止大型目录一次性占满模型上下文。
 const MAX_DIRECTORY_ENTRIES = 200;
 
+// 搜索结果和扫描规模都设置上限，避免大型 workspace 长时间占用 Agent Loop，
+// 也避免匹配内容一次性撑满模型上下文。
+const DEFAULT_SEARCH_RESULTS = 50;
+const MAX_SEARCH_RESULTS = 200;
+const MAX_SEARCHED_FILES = 10_000;
+const MAX_SEARCH_LINE_CHARACTERS = 500;
+
 // Shell 命令默认最长运行 30 秒，宿主可调整，但不允许超过 2 分钟。
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const MAX_COMMAND_TIMEOUT_MS = 120_000;
@@ -82,9 +98,9 @@ const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 // 这不是 Shell 沙箱，而是防止 `env` 等普通命令直接暴露 API Key 的额外防线。
 const SENSITIVE_ENVIRONMENT_NAME = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|AUTHORIZATION|COOKIE|SESSION|JWT)(?:_|$)/i;
 
-// 当前三个工具都是只读或纯计算能力，可以直接执行。
+// 当前四个工具都是只读或纯计算能力，可以直接执行。
 // 未登记的新工具默认需要用户确认，避免未来加入写文件、Shell 等能力时意外绕过审批。
-const AUTO_APPROVED_TOOLS = new Set(["calculator", "list_directory", "read_text_file"]);
+const AUTO_APPROVED_TOOLS = new Set(["calculator", "list_directory", "search_files", "read_text_file"]);
 
 export function requiresToolConfirmation(name: string): boolean {
   return !AUTO_APPROVED_TOOLS.has(name);
@@ -126,6 +142,39 @@ export const toolDefinitions: ToolDefinition[] = [
         },
       },
       required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "search_files",
+    description: "Call this to find a literal text string recursively inside workspace files. Results include workspace-relative file paths, line numbers, columns, and matching line text. This is read-only and case-sensitive.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Non-empty literal text to find. It is not a regular expression.",
+        },
+        path: {
+          type: "string",
+          description: "Workspace-relative directory to search recursively. Use '.' for the workspace root.",
+        },
+        file_pattern: {
+          anyOf: [{ type: "string" }, { type: "null" }],
+          description: "Glob matched against workspace-relative file paths, for example '**/*.ts'. Use null to search all files.",
+        },
+        max_results: {
+          anyOf: [
+            { type: "integer", minimum: 1, maximum: MAX_SEARCH_RESULTS },
+            { type: "null" },
+          ],
+          description: `Maximum matches to return. Use null for the default of ${DEFAULT_SEARCH_RESULTS}.`,
+        },
+      },
+      // OpenAI strict function schemas require every property name in required.
+      // Nullable fields preserve optional behavior while keeping the same definition valid for both Providers.
+      required: ["query", "path", "file_pattern", "max_results"],
       additionalProperties: false,
     },
   },
@@ -230,6 +279,8 @@ export async function executeTool(
       return runCalculator(parseCalculatorInput(input));
     case "list_directory":
       return listDirectory(parseListDirectoryInput(input), context);
+    case "search_files":
+      return searchFiles(parseSearchFilesInput(input), context);
     case "read_text_file":
       return readTextFile(parseReadTextFileInput(input), context);
     case "write_text_file":
@@ -251,6 +302,39 @@ function parseListDirectoryInput(input: unknown): ListDirectoryInput {
   }
 
   return { path: input.path };
+}
+
+function parseSearchFilesInput(input: unknown): SearchFilesInput {
+  if (!isRecord(input) || typeof input.query !== "string" || typeof input.path !== "string") {
+    throw new Error("search_files requires string query and path");
+  }
+  if (input.query.length === 0) {
+    throw new Error("search_files query must not be empty");
+  }
+  if (Buffer.byteLength(input.query, "utf8") > 1024) {
+    throw new Error("search_files query is too long; maximum is 1024 bytes");
+  }
+  const filePattern = input.file_pattern;
+  if (filePattern !== undefined && filePattern !== null && (typeof filePattern !== "string" || filePattern.length === 0)) {
+    throw new Error("search_files file_pattern must be a non-empty string");
+  }
+  if (typeof filePattern === "string" && Buffer.byteLength(filePattern, "utf8") > 1024) {
+    throw new Error("search_files file_pattern is too long; maximum is 1024 bytes");
+  }
+  const maxResults = input.max_results;
+  if (
+    maxResults !== undefined && maxResults !== null
+    && (typeof maxResults !== "number" || !Number.isInteger(maxResults) || maxResults < 1 || maxResults > MAX_SEARCH_RESULTS)
+  ) {
+    throw new Error(`search_files max_results must be an integer between 1 and ${MAX_SEARCH_RESULTS}`);
+  }
+
+  return {
+    query: input.query,
+    path: input.path,
+    filePattern: filePattern ?? undefined,
+    maxResults: maxResults ?? DEFAULT_SEARCH_RESULTS,
+  };
 }
 
 // 工具参数来自模型输出，即使 schema 是 strict，也仍然属于系统边界输入。
@@ -597,6 +681,131 @@ async function listDirectory(input: ListDirectoryInput, context: ToolContext): P
     entries,
     truncated: allEntries.length > MAX_DIRECTORY_ENTRIES,
   }, null, 2);
+}
+
+interface SearchMatch {
+  path: string;
+  line: number;
+  column: number;
+  text: string;
+}
+
+async function searchFiles(input: SearchFilesInput, context: ToolContext): Promise<string> {
+  const { root, realTarget } = await resolveWorkspacePath(input.path, context);
+  const targetStat = await fs.stat(realTarget);
+  if (!targetStat.isDirectory()) {
+    throw new Error("search path is not a directory");
+  }
+
+  const filePattern = input.filePattern?.replaceAll("\\", "/");
+  const filePatternRegex = filePattern ? compileFilePattern(filePattern) : undefined;
+
+  const matches: SearchMatch[] = [];
+  const pendingDirectories = [realTarget];
+  let searchedFiles = 0;
+  let truncated = false;
+
+  searchLoop: while (pendingDirectories.length > 0) {
+    const directory = pendingDirectories.shift();
+    if (!directory) break;
+
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+
+    for (const entry of entries) {
+      // 不跟随搜索目录中的符号链接：这样即使链接指向 workspace 内部，也不会重复搜索；
+      // 指向 workspace 外部时更不会形成越界读取。
+      if (entry.isSymbolicLink()) continue;
+
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        pendingDirectories.push(entryPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      const relativePath = path.relative(root, entryPath).split(path.sep).join("/");
+      if (filePatternRegex && !filePatternRegex.test(relativePath)) continue;
+
+      searchedFiles += 1;
+      if (searchedFiles > MAX_SEARCHED_FILES) {
+        truncated = true;
+        break searchLoop;
+      }
+
+      const stat = await fs.stat(entryPath);
+      if (stat.size > MAX_FILE_BYTES) continue;
+
+      const content = await fs.readFile(entryPath);
+      // NUL 字节是二进制文件的可靠低成本信号。二进制内容不应作为 UTF-8 行文本返回给模型。
+      if (content.includes(0)) continue;
+
+      const lines = content.toString("utf8").split("\n");
+      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+        const line = lines[lineIndex]?.replace(/\r$/, "") ?? "";
+        const matchIndex = line.indexOf(input.query);
+        if (matchIndex === -1) continue;
+
+        // 多个匹配位于同一行时只返回一条，行为接近常用文本搜索工具，且能控制上下文体积。
+        if (matches.length >= input.maxResults) {
+          truncated = true;
+          break searchLoop;
+        }
+        matches.push({
+          path: relativePath,
+          line: lineIndex + 1,
+          column: matchIndex + 1,
+          text: createSearchLinePreview(line, matchIndex, input.query.length),
+        });
+      }
+    }
+  }
+
+  const relativeSearchPath = path.relative(root, realTarget).split(path.sep).join("/");
+  return JSON.stringify({
+    query: input.query,
+    path: relativeSearchPath.length === 0 ? "." : relativeSearchPath,
+    file_pattern: filePattern,
+    matches,
+    truncated,
+  }, null, 2);
+}
+
+function createSearchLinePreview(line: string, matchIndex: number, queryLength: number): string {
+  if (line.length <= MAX_SEARCH_LINE_CHARACTERS) return line;
+
+  const contextCharacters = Math.max(0, MAX_SEARCH_LINE_CHARACTERS - Math.min(queryLength, MAX_SEARCH_LINE_CHARACTERS));
+  const start = Math.max(0, matchIndex - Math.floor(contextCharacters / 2));
+  const end = Math.min(line.length, start + MAX_SEARCH_LINE_CHARACTERS);
+  return `${start > 0 ? "…" : ""}${line.slice(start, end)}${end < line.length ? "…" : ""}`;
+}
+
+function compileFilePattern(pattern: string): RegExp {
+  let expression = "^";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index] ?? "";
+    if (character === "*" && pattern[index + 1] === "*") {
+      // **/ 也匹配零层目录，所以 **/*.ts 能同时匹配 a.ts 和 src/a.ts。
+      if (pattern[index + 2] === "/") {
+        expression += "(?:.*/)?";
+        index += 2;
+      } else {
+        expression += ".*";
+        index += 1;
+      }
+      continue;
+    }
+    if (character === "*") {
+      expression += "[^/]*";
+      continue;
+    }
+    if (character === "?") {
+      expression += "[^/]";
+      continue;
+    }
+    expression += character.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+  }
+  return new RegExp(`${expression}$`);
 }
 
 function getDirectoryEntryType(entry: import("node:fs").Dirent): "file" | "directory" | "symbolic_link" | "other" {

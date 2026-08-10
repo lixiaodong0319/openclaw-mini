@@ -232,6 +232,114 @@ describe("tools", () => {
     expect(output.truncated).toBe(true);
   });
 
+  it("searches text files recursively with line and column locations", async () => {
+    await fs.mkdir(path.join(workspaceRoot, "src"));
+    await fs.writeFile(path.join(workspaceRoot, "README.md"), "OpenClaw Mini\n", "utf8");
+    await fs.writeFile(path.join(workspaceRoot, "src", "agent.ts"), "first line\nconst name = 'OpenClaw';\n", "utf8");
+
+    const output = JSON.parse(await executeTool(
+      "search_files",
+      { query: "OpenClaw", path: "." },
+      { workspaceRoot },
+    )) as {
+      query: string;
+      path: string;
+      matches: Array<{ path: string; line: number; column: number; text: string }>;
+      truncated: boolean;
+    };
+
+    expect(output).toEqual({
+      query: "OpenClaw",
+      path: ".",
+      matches: [
+        { path: "README.md", line: 1, column: 1, text: "OpenClaw Mini" },
+        { path: "src/agent.ts", line: 2, column: 15, text: "const name = 'OpenClaw';" },
+      ],
+      truncated: false,
+    });
+  });
+
+  it("filters searches by directory and workspace-relative glob", async () => {
+    await fs.mkdir(path.join(workspaceRoot, "src"));
+    await fs.writeFile(path.join(workspaceRoot, "src", "agent.ts"), "needle", "utf8");
+    await fs.writeFile(path.join(workspaceRoot, "src", "agent.js"), "needle", "utf8");
+    await fs.writeFile(path.join(workspaceRoot, "outside.ts"), "needle", "utf8");
+
+    const output = JSON.parse(await executeTool(
+      "search_files",
+      { query: "needle", path: "src", file_pattern: "**/*.ts" },
+      { workspaceRoot },
+    )) as { path: string; file_pattern: string; matches: Array<{ path: string }> };
+
+    expect(output.path).toBe("src");
+    expect(output.file_pattern).toBe("**/*.ts");
+    expect(output.matches).toEqual([{ path: "src/agent.ts", line: 1, column: 1, text: "needle" }]);
+  });
+
+  it("limits search results and reports truncation", async () => {
+    await fs.writeFile(path.join(workspaceRoot, "matches.txt"), "hit\nhit\nhit\n", "utf8");
+
+    const output = JSON.parse(await executeTool(
+      "search_files",
+      { query: "hit", path: ".", max_results: 2 },
+      { workspaceRoot },
+    )) as { matches: unknown[]; truncated: boolean };
+
+    expect(output.matches).toHaveLength(2);
+    expect(output.truncated).toBe(true);
+  });
+
+  it("uses search defaults when strict Provider arguments are null", async () => {
+    await fs.writeFile(path.join(workspaceRoot, "note.txt"), "needle", "utf8");
+
+    const output = JSON.parse(await executeTool(
+      "search_files",
+      { query: "needle", path: ".", file_pattern: null, max_results: null },
+      { workspaceRoot },
+    )) as { matches: unknown[]; truncated: boolean };
+
+    expect(output.matches).toHaveLength(1);
+    expect(output.truncated).toBe(false);
+  });
+
+  it("skips binary files while searching", async () => {
+    await fs.writeFile(path.join(workspaceRoot, "binary.dat"), Buffer.from([110, 101, 101, 100, 108, 101, 0]));
+    await fs.writeFile(path.join(workspaceRoot, "real.txt"), "needle", "utf8");
+
+    const output = JSON.parse(await executeTool(
+      "search_files",
+      { query: "needle", path: "." },
+      { workspaceRoot },
+    )) as { matches: Array<{ path: string }> };
+
+    expect(output.matches.map((match) => match.path)).toEqual(["real.txt"]);
+  });
+
+  it.skipIf(process.platform === "win32")("does not follow symbolic links while searching", async () => {
+    await fs.writeFile(path.join(workspaceRoot, "real.txt"), "needle", "utf8");
+    await fs.symlink(path.join(workspaceRoot, "real.txt"), path.join(workspaceRoot, "link.txt"));
+
+    const output = JSON.parse(await executeTool(
+      "search_files",
+      { query: "needle", path: "." },
+      { workspaceRoot },
+    )) as { matches: Array<{ path: string }> };
+
+    expect(output.matches.map((match) => match.path)).toEqual(["real.txt"]);
+  });
+
+  it("validates search paths and limits", async () => {
+    await expect(executeTool("search_files", { query: "x", path: ".." }, { workspaceRoot }))
+      .rejects.toThrow("workspace");
+    await expect(executeTool("search_files", { query: "", path: "." }, { workspaceRoot }))
+      .rejects.toThrow("must not be empty");
+    await expect(executeTool(
+      "search_files",
+      { query: "x", path: ".", max_results: 201 },
+      { workspaceRoot },
+    )).rejects.toThrow("between 1 and 200");
+  });
+
   it("runs calculator operations", async () => {
     await expect(executeTool("calculator", { operation: "multiply", a: 12, b: 7 }, { workspaceRoot })).resolves.toBe("84");
   });
@@ -358,6 +466,7 @@ describe("tools", () => {
   it("requires confirmation by default except for registered safe tools", () => {
     expect(requiresToolConfirmation("calculator")).toBe(false);
     expect(requiresToolConfirmation("list_directory")).toBe(false);
+    expect(requiresToolConfirmation("search_files")).toBe(false);
     expect(requiresToolConfirmation("read_text_file")).toBe(false);
     expect(requiresToolConfirmation("write_text_file")).toBe(true);
     expect(requiresToolConfirmation("edit_text_file")).toBe(true);
