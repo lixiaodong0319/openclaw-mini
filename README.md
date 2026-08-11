@@ -10,6 +10,7 @@
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
+- 启动时读取 `workspace/AGENTS.md`，作为 CLI 与 Web 共用的工作区指令
 - 十三个最小工具：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
@@ -53,6 +54,7 @@ src/
   session-history.ts 两种 Provider 原生历史到安全展示视图的转换
   session-store.ts   JSONL 会话存储
   tools.ts           工具定义与执行逻辑
+  workspace-instructions.ts 工作区 AGENTS.md 的加载、校验和提示词组装
   web.ts             本地 Web 服务入口
   web-server.ts      HTTP、SSE、Session 并发和工具确认接口
   web-page.ts        无框架的单页聊天界面
@@ -69,6 +71,7 @@ test/
   session-history.test.ts 会话历史展示转换测试
   tools.test.ts          工具边界测试
   web-server.test.ts     Web、SSE 和浏览器确认测试
+  workspace-instructions.test.ts 工作区指令加载与安全边界测试
 
 workspace/            Agent 可读取的工作区
 data/                 本地会话历史，已被 .gitignore 忽略
@@ -114,6 +117,22 @@ export OPENCLAW_MODEL="gpt-5.3-codex"
 ```
 
 OpenAI Provider 也支持 `OPENAI_MODEL`，但 `OPENCLAW_MODEL` 优先级更高。
+
+### 工作区指令
+
+可以在 workspace 根目录创建 `AGENTS.md`，为模型提供当前项目的长期约定：
+
+```markdown
+# 项目约定
+
+- 使用 TypeScript
+- 修改后运行 pnpm test
+- 用中文说明结果
+```
+
+CLI 和 Web 启动时读取这一份文件，并把内容和默认系统提示词一起传给当前 Provider。启动信息中的 `Instructions: AGENTS.md (N bytes)` 表示加载成功；`Instructions: not found` 表示文件不存在。Web 页面顶部也会显示对应状态。
+
+只读取 `workspace/AGENTS.md`，不会递归查找子目录或父目录。文件必须是最大 32 KiB 的普通 UTF-8 文本，符号链接、目录、NUL 二进制内容和非法 UTF-8 会使启动失败。指令不会写入 Session JSONL，也不参与会话压缩；修改文件后需要重启 CLI 或 Web 才会生效。
 
 ### 上下文压缩配置
 
@@ -337,6 +356,7 @@ pnpm run build
 - 压缩后 JSONL 历史原子替换
 - 旧 Anthropic 会话向独立目录的无覆盖迁移
 - JSONL 会话保存与加载
+- workspace 根目录指令的加载、提示词注入、大小与文本格式边界
 
 ## 当前定位
 

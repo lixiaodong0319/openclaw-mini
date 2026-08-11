@@ -103,7 +103,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
       const sessions = await sessionsResponse.json();
       runtimeElement.textContent = "Provider: " + config.provider
         + " | Model: " + config.model
-        + " | Workspace: " + config.workspace;
+        + " | Workspace: " + config.workspace
+        + " | Instructions: " + (config.instructions || "not found");
       (sessions.sessions.length > 0 ? sessions.sessions : ["default"]).forEach(addSession);
       if ([...sessionElement.options].some((option) => option.value === "default")) {
         sessionElement.value = "default";

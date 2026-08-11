@@ -8,12 +8,14 @@ import type {
 import type { RuntimeConfig } from "./runtime.js";
 import { formatRuntimeError } from "./runtime.js";
 import type { SessionHistoryView } from "./session-history.js";
+import type { WorkspaceInstructions } from "./workspace-instructions.js";
 import { WEB_PAGE } from "./web-page.js";
 
 type AgentRunner = Pick<AgentLoop, "runTurn">;
 
 export interface WebServerOptions {
   config: RuntimeConfig;
+  workspaceInstructions?: WorkspaceInstructions;
   getAgent: (sessionId: string) => Promise<AgentRunner>;
   listSessions: () => Promise<string[]>;
   loadHistory: (sessionId: string) => Promise<SessionHistoryView>;
@@ -86,6 +88,7 @@ async function routeRequest(
       provider: options.config.providerName,
       model: options.config.model,
       workspace: options.config.workspaceRoot,
+      instructions: options.workspaceInstructions?.relativePath ?? null,
     });
     return;
   }

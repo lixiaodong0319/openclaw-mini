@@ -9,11 +9,12 @@ import {
 import { listSessionIds } from "./session-store.js";
 import { loadSessionHistory } from "./session-history.js";
 import { createWebServer } from "./web-server.js";
+import { describeWorkspaceInstructions } from "./workspace-instructions.js";
 
 async function main(): Promise<void> {
   const config = resolveRuntimeConfig();
   // 在列出 Session 前完成旧 Anthropic 历史迁移，让下拉框立即显示旧会话。
-  await prepareRuntime(config);
+  const preparation = await prepareRuntime(config);
 
   // 每个 session 在进程内只创建一个 AgentLoop，保证其内存历史与 JSONL 追加顺序一致。
   // Promise 也进入缓存，可合并同一 session 的并发首次加载；加载失败则允许下次重试。
@@ -21,7 +22,7 @@ async function main(): Promise<void> {
   const getAgent = (sessionId: string): Promise<AgentLoop> => {
     const cached = agents.get(sessionId);
     if (cached) return cached;
-    const created = createAgentRuntime(sessionId, config).then((runtime) => runtime.agent);
+    const created = createAgentRuntime(sessionId, config, preparation).then((runtime) => runtime.agent);
     agents.set(sessionId, created);
     created.catch(() => agents.delete(sessionId));
     return created;
@@ -29,6 +30,7 @@ async function main(): Promise<void> {
 
   const server = createWebServer({
     config,
+    workspaceInstructions: preparation.workspaceInstructions,
     getAgent,
     listSessions: () => listSessionIds(
       config.dataRoot,
@@ -52,6 +54,7 @@ async function main(): Promise<void> {
   console.log(`Provider: ${config.providerName}`);
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);
+  console.log(`Instructions: ${describeWorkspaceInstructions(preparation.workspaceInstructions)}`);
   console.log("按 Ctrl+C 退出。");
 }
 

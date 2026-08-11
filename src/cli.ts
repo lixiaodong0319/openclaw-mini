@@ -9,18 +9,21 @@ import {
   formatRuntimeError,
   resolveRuntimeConfig,
 } from "./runtime.js";
+import { describeWorkspaceInstructions } from "./workspace-instructions.js";
 
 async function main(): Promise<void> {
   // CLI 参数目前只解析 --session，保持入口足够小。
   // 更多配置先用环境变量承载，例如 OPENCLAW_MODEL。
   const sessionId = parseSessionId(process.argv.slice(2));
   const config = resolveRuntimeConfig();
-  const { agent } = await createAgentRuntime(sessionId, config);
+  const runtime = await createAgentRuntime(sessionId, config);
+  const { agent } = runtime;
 
   console.log(`OpenClaw Mini session: ${sessionId}`);
   console.log(`Provider: ${config.providerName}`);
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);
+  console.log(`Instructions: ${describeWorkspaceInstructions(runtime.workspaceInstructions)}`);
   console.log("输入 /exit 退出。\n");
 
   // 使用 readline/promises 实现最小 REPL。

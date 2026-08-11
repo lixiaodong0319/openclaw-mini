@@ -95,6 +95,11 @@ describe("Web server", () => {
   it("serves the page, runtime config, and session list", async () => {
     const server = createWebServer({
       config,
+      workspaceInstructions: {
+        relativePath: "AGENTS.md",
+        content: "Use TypeScript.",
+        bytes: 15,
+      },
       getAgent: async () => createRunner(async () => ({ text: "", stopReason: "done" })),
       listSessions: async () => ["default", "demo"],
       loadHistory: async (sessionId) => ({
@@ -113,6 +118,7 @@ describe("Web server", () => {
       provider: "openai",
       model: "test-model",
       workspace: "/project/workspace",
+      instructions: "AGENTS.md",
     });
     await expect(fetch(`${baseUrl}/api/sessions`).then((response) => response.json())).resolves.toEqual({
       sessions: ["default", "demo"],

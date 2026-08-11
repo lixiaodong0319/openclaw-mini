@@ -18,6 +18,11 @@ import {
   type OpenAIInputItem,
 } from "./provider.js";
 import { migrateLegacyAnthropicSessions, SessionStore } from "./session-store.js";
+import {
+  buildSystemPrompt,
+  loadWorkspaceInstructions,
+  type WorkspaceInstructions,
+} from "./workspace-instructions.js";
 
 export type ProviderName = "anthropic" | "openai";
 
@@ -32,6 +37,11 @@ export interface RuntimeConfig {
 export interface AgentRuntime extends RuntimeConfig {
   sessionId: string;
   agent: AgentLoop;
+  workspaceInstructions?: WorkspaceInstructions;
+}
+
+export interface RuntimePreparation {
+  workspaceInstructions?: WorkspaceInstructions;
 }
 
 // CLI 和 Web 都从这里解析路径与模型，避免两个入口逐渐出现不同默认值。
@@ -49,24 +59,34 @@ export function resolveRuntimeConfig(projectRoot = process.cwd()): RuntimeConfig
 export async function createAgentRuntime(
   sessionId: string,
   config = resolveRuntimeConfig(),
+  preparation?: RuntimePreparation,
 ): Promise<AgentRuntime> {
-  await prepareRuntime(config);
+  const prepared = preparation ?? await prepareRuntime(config);
   const agent = await createAgent(
     config.providerName,
     config.dataRoot,
     sessionId,
     config.workspaceRoot,
     config.model,
+    prepared.workspaceInstructions,
   );
-  return { ...config, sessionId, agent };
+  return {
+    ...config,
+    sessionId,
+    agent,
+    workspaceInstructions: prepared.workspaceInstructions,
+  };
 }
 
-export async function prepareRuntime(config: RuntimeConfig): Promise<void> {
+export async function prepareRuntime(config: RuntimeConfig): Promise<RuntimePreparation> {
   // workspace 是文件工具的安全边界；首次运行时自动创建。
   await fs.mkdir(config.workspaceRoot, { recursive: true });
   if (config.providerName === "anthropic") {
     await migrateLegacyAnthropicSessions(config.dataRoot);
   }
+  return {
+    workspaceInstructions: await loadWorkspaceInstructions(config.workspaceRoot),
+  };
 }
 
 async function createAgent(
@@ -75,8 +95,10 @@ async function createAgent(
   sessionId: string,
   workspaceRoot: string,
   model: string,
+  workspaceInstructions?: WorkspaceInstructions,
 ): Promise<AgentLoop> {
   const compaction = getContextCompactionOptions();
+  const systemPrompt = buildSystemPrompt(workspaceInstructions);
   const toolContext = {
     workspaceRoot,
     commandTimeoutMs: getCommandTimeoutMs(),
@@ -95,6 +117,7 @@ async function createAgent(
         compaction,
       }),
       toolContext,
+      systemPrompt,
     });
   }
 
@@ -109,6 +132,7 @@ async function createAgent(
       compaction,
     }),
     toolContext,
+    systemPrompt,
   });
 }
 
