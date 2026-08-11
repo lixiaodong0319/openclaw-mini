@@ -76,10 +76,11 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
 
   async compactHistoryIfNeeded(
     onStart?: (estimatedTokens: number) => void,
+    force = false,
   ): Promise<ContextCompactionResult | undefined> {
     // 第一层是廉价判断：未达阈值时不找切分点，更不发额外 API 请求。
     const beforeTokens = estimateContextTokens(this.messages);
-    if (beforeTokens < this.compaction.tokenThreshold) {
+    if (!force && beforeTokens < this.compaction.tokenThreshold) {
       return undefined;
     }
 
@@ -137,6 +138,12 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
       beforeTokens,
       afterTokens: estimateContextTokens(replacement),
     };
+  }
+
+  async clearHistory(): Promise<void> {
+    // 与压缩替换保持相同顺序：磁盘写入成功后再修改内存，失败时仍可安全重试。
+    await this.onHistoryReplace?.([]);
+    this.messages.splice(0, this.messages.length);
   }
 
   async addUserText(text: string): Promise<void> {
@@ -409,10 +416,11 @@ export class OpenAIProvider implements AgentProvider {
 
   async compactHistoryIfNeeded(
     onStart?: (estimatedTokens: number) => void,
+    force = false,
   ): Promise<ContextCompactionResult | undefined> {
     // OpenAI 与 Anthropic 共用同一个估算和保留策略，但不共用历史数据格式。
     const beforeTokens = estimateContextTokens(this.input);
-    if (beforeTokens < this.compaction.tokenThreshold) {
+    if (!force && beforeTokens < this.compaction.tokenThreshold) {
       return undefined;
     }
 
@@ -463,6 +471,11 @@ export class OpenAIProvider implements AgentProvider {
       beforeTokens,
       afterTokens: estimateContextTokens(replacement),
     };
+  }
+
+  async clearHistory(): Promise<void> {
+    await this.onHistoryReplace?.([]);
+    this.input.splice(0, this.input.length);
   }
 
   async addUserText(text: string): Promise<void> {

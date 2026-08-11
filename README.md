@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 本地命令行 REPL 对话
+- 本地命令行 REPL 对话，支持状态、历史、手动压缩和清空等内置命令
 - 本地 Web 对话，可选择、新建并回放 Session 历史
 - 模型文本流式输出，显示工具确认、执行中、完成和失败状态
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
@@ -45,6 +45,7 @@
 src/
   apply-patch.ts     多文件补丁解析、预检和应用逻辑
   agent-loop.ts      厂商无关的统一 Agent Loop
+  cli-commands.ts    CLI 命令解析、帮助和安全历史格式化
   cli.ts             本地命令行入口
   context-compaction.ts 上下文估算、压缩阈值和保留策略
   fetch-url.ts       公网文本请求、DNS 固定和 SSRF 防护
@@ -62,6 +63,7 @@ src/
 test/
   agent-loop.test.ts     Agent Loop 测试
   apply-patch.test.ts    多文件补丁和安全边界测试
+  cli-commands.test.ts   CLI 命令解析和历史格式化测试
   openai-adapter.test.ts OpenAI 适配器测试
   openai-provider.test.ts OpenAI HTTP Provider 测试
   fake-provider.ts       测试用 Fake Provider
@@ -136,10 +138,10 @@ CLI 和 Web 启动时读取这一份文件，并把内容和默认系统提示�
 
 ### 上下文压缩配置
 
-历史记录默认超过约 32,000 tokens 时，会在下一轮开始前调用当前 Provider 生成早期会话摘要，并保留最近 4 个完整用户轮次。可通过环境变量调整：
+历史记录默认超过约 320,000 tokens 时，会在下一轮开始前调用当前 Provider 生成早期会话摘要，并保留最近 4 个完整用户轮次。可通过环境变量调整：
 
 ```bash
-export OPENCLAW_COMPACT_THRESHOLD="32000"
+export OPENCLAW_COMPACT_THRESHOLD="320000"
 export OPENCLAW_COMPACT_KEEP_TURNS="4"
 export OPENCLAW_COMPACT_SUMMARY_TOKENS="2000"
 ```
@@ -174,11 +176,22 @@ pnpm dev
 pnpm dev -- --session smoke
 ```
 
-退出：
+输入 `/help` 可以查看全部内置命令：
 
 ```text
-/exit
+/help       查看命令帮助
+/status     查看当前 Provider、模型、Session、workspace 和指令状态
+/history    查看当前 Session 的安全历史视图
+/compact    手动压缩早期会话历史
+/clear      清空当前 Session 历史（需要确认）
+/exit       退出
 ```
+
+未知的 `/命令` 不会发送给模型。内置命令目前不接受参数，命令名不区分大小写。
+
+`/history` 与 Web 使用相同的安全历史视图，不展示 OpenAI reasoning、Anthropic thinking、工具参数或工具输出；最多显示 200 项，每条长文本最多显示 2,000 个字符。
+
+`/compact` 会跳过自动压缩的 token 阈值，但仍遵守最近轮次保留规则；默认至少需要超过 4 个完整用户轮次才有早期历史可压缩。`/clear` 只有明确输入 `y` 或 `yes` 才执行，并会同时清空当前 Agent 的内存历史和对应 Provider 的 Session JSONL。两项操作都不会影响其他 Session。
 
 模型生成的文本会直接流式显示。发生工具调用时，终端会显示执行状态：
 
@@ -191,8 +204,8 @@ workspace 中包含 note.txt。
 触发上下文压缩时，终端会显示：
 
 ```text
-[会话] 正在压缩上下文（约 32840 tokens）...
-[会话] 上下文压缩完成（32840 → 6210 tokens）
+[会话] 正在压缩上下文（约 328400 tokens）...
+[会话] 上下文压缩完成（328400 → 62100 tokens）
 ```
 
 `calculator`、`list_directory`、`find_files`、`search_files`、`read_text_file`、`git_status` 和 `git_diff` 是无副作用工具，会自动执行。`create_directory`、`write_text_file`、`edit_text_file`、`apply_patch`、`fetch_url` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
@@ -353,6 +366,7 @@ pnpm run build
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic/OpenAI 会话历史统一展示与内部数据过滤
 - Anthropic 和 OpenAI 历史摘要压缩与最近工具链保留
+- CLI 命令解析、安全历史展示、阈值外手动压缩和原子清空
 - 压缩后 JSONL 历史原子替换
 - 旧 Anthropic 会话向独立目录的无覆盖迁移
 - JSONL 会话保存与加载

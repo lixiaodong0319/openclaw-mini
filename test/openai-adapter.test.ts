@@ -134,6 +134,34 @@ describe("OpenAIProvider adapter", () => {
     expect(events[1]).toMatchObject({ type: "context_compaction_end" });
   });
 
+  it("manually compacts below the automatic threshold and can clear history", async () => {
+    const input: OpenAIInputItem[] = [
+      { role: "user", content: "old question" },
+      outputMessage("old answer"),
+      { role: "user", content: "recent question" },
+      outputMessage("recent answer"),
+    ];
+    const client = new FakeOpenAIProvider([
+      openAIResponse([outputMessage("manual summary")]),
+    ]);
+    const replacements: OpenAIInputItem[][] = [];
+    const loop = createLoop(client, input, workspaceRoot, {
+      compaction: { tokenThreshold: 999_999, keepRecentTurns: 1 },
+      onHistoryReplace: async (replacement) => {
+        replacements.push(structuredClone(replacement));
+      },
+    });
+
+    await expect(loop.compactContext()).resolves.toBeDefined();
+    expect(client.calls).toHaveLength(1);
+    expect(replacements).toHaveLength(1);
+
+    await loop.clearHistory();
+
+    expect(replacements.at(-1)).toEqual([]);
+    expect(input).toEqual([]);
+  });
+
   it("preserves reasoning items and returns function output", async () => {
     const reasoning = { type: "reasoning", id: "rs_1", summary: [] } satisfies OpenAIResponseItem;
     const client = new FakeOpenAIProvider([

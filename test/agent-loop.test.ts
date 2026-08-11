@@ -134,6 +134,55 @@ describe("AgentLoop", () => {
     }
   });
 
+  it("manually compacts below the automatic threshold and can clear history", async () => {
+    const messages: Anthropic.MessageParam[] = [
+      { role: "user", content: [{ type: "text", text: "old question" }] },
+      { role: "assistant", content: [{ type: "text", text: "old answer" }] },
+      { role: "user", content: [{ type: "text", text: "recent question" }] },
+      { role: "assistant", content: [{ type: "text", text: "recent answer" }] },
+    ];
+    const client = new FakeProvider([
+      message([textBlock("manual summary")], "end_turn"),
+    ]);
+    const replacements: Anthropic.MessageParam[][] = [];
+    const loop = createLoop(client, messages, workspaceRoot, {
+      compaction: { tokenThreshold: 999_999, keepRecentTurns: 1 },
+      onHistoryReplace: async (replacement) => {
+        replacements.push(structuredClone(replacement));
+      },
+    });
+    const events: AgentEvent[] = [];
+
+    const result = await loop.compactContext((event) => events.push(event));
+
+    expect(result).toBeDefined();
+    expect(client.calls).toHaveLength(1);
+    expect(replacements).toHaveLength(1);
+    expect(events.map((event) => event.type)).toEqual([
+      "context_compaction_start",
+      "context_compaction_end",
+    ]);
+
+    await loop.clearHistory();
+
+    expect(replacements.at(-1)).toEqual([]);
+    expect(messages).toEqual([]);
+  });
+
+  it("keeps Anthropic memory when clearing persisted history fails", async () => {
+    const messages: Anthropic.MessageParam[] = [
+      { role: "user", content: "keep me" },
+    ];
+    const loop = createLoop(new FakeProvider([]), messages, workspaceRoot, {
+      onHistoryReplace: async () => {
+        throw new Error("disk failed");
+      },
+    });
+
+    await expect(loop.clearHistory()).rejects.toThrow("disk failed");
+    expect(messages).toEqual([{ role: "user", content: "keep me" }]);
+  });
+
   it("emits tool start and completion events", async () => {
     const provider = new FakeProvider([
       message([toolUseBlock("toolu_1", "calculator", { operation: "add", a: 1, b: 2 })], "tool_use"),

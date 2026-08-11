@@ -65,7 +65,12 @@ export type ProviderTurn =
 export interface AgentProvider {
   // 可选方法使无历史或不支持压缩的 Provider 仍可复用 AgentLoop。
   // 具体 Provider 拥有原生历史，因此由它负责找安全切分点并生成合法替换结构。
-  compactHistoryIfNeeded?(onStart?: (estimatedTokens: number) => void): Promise<ContextCompactionResult | undefined>;
+  compactHistoryIfNeeded?(
+    onStart?: (estimatedTokens: number) => void,
+    force?: boolean,
+  ): Promise<ContextCompactionResult | undefined>;
+  // 清空同样由 Provider 执行，确保内存中的原生历史和持久化 JSONL 一起替换。
+  clearHistory?(): Promise<void>;
   addUserText(text: string): Promise<void>;
   generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn>;
   addToolResults(results: ToolExecutionResult[]): Promise<void>;
@@ -112,14 +117,7 @@ export class AgentLoop {
     // 1. 此时上一轮已经完整结束，不会把当前工具调用链拦腰切断；
     // 2. 新的用户问题不会被误放进“早期历史”摘要；
     // 3. 摘要失败时还没有持久化本轮用户消息，用户可以安全重试。
-    const compaction = await this.provider.compactHistoryIfNeeded?.((estimatedTokens) => {
-      onEvent?.({ type: "context_compaction_start", estimatedTokens });
-    });
-
-    if (compaction) {
-      // Provider 返回结果意味着新历史已持久化并替换内存，此时才对外宣布完成。
-      onEvent?.({ type: "context_compaction_end", ...compaction });
-    }
+    await this.compactContextIfAvailable(onEvent, false);
 
     await this.provider.addUserText(userText);
 
@@ -215,6 +213,38 @@ export class AgentLoop {
     const text = "Agent Loop 达到最大工具迭代次数。";
     emitUnstreamedFinalText(text, "", onEvent);
     return { text, stopReason: "iteration_limit" };
+  }
+
+  // CLI 的 /compact 使用同一套 Provider 摘要逻辑，只跳过 token 阈值判断。
+  // 安全切分规则仍然生效：没有足够的早期完整轮次时返回 undefined，不强拆工具链。
+  async compactContext(
+    onEvent?: AgentEventHandler,
+  ): Promise<ContextCompactionResult | undefined> {
+    return this.compactContextIfAvailable(onEvent, true);
+  }
+
+  // 先让 Provider 持久化空历史，成功后 Provider 才会清空内存。
+  // 不支持清空的测试/第三方 Provider 会明确报错，而不是只清掉一侧状态。
+  async clearHistory(): Promise<void> {
+    if (!this.provider.clearHistory) {
+      throw new Error("current provider does not support clearing history");
+    }
+    await this.provider.clearHistory();
+  }
+
+  private async compactContextIfAvailable(
+    onEvent: AgentEventHandler | undefined,
+    force: boolean,
+  ): Promise<ContextCompactionResult | undefined> {
+    const compaction = await this.provider.compactHistoryIfNeeded?.((estimatedTokens) => {
+      onEvent?.({ type: "context_compaction_start", estimatedTokens });
+    }, force);
+
+    if (compaction) {
+      // Provider 返回结果意味着新历史已持久化并替换内存，此时才对外宣布完成。
+      onEvent?.({ type: "context_compaction_end", ...compaction });
+    }
+    return compaction;
   }
 }
 

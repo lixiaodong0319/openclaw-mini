@@ -1,14 +1,24 @@
 import { createInterface, type Interface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
+  type AgentLoop,
   type AgentEvent,
   type ToolConfirmationRequest,
 } from "./agent-loop.js";
 import {
+  CLI_HELP_TEXT,
+  formatSessionHistory,
+  isCliCommandName,
+  parseCliCommand,
+  type CliCommandName,
+} from "./cli-commands.js";
+import {
   createAgentRuntime,
   formatRuntimeError,
   resolveRuntimeConfig,
+  type RuntimeConfig,
 } from "./runtime.js";
+import { loadSessionHistory } from "./session-history.js";
 import { describeWorkspaceInstructions } from "./workspace-instructions.js";
 
 async function main(): Promise<void> {
@@ -24,7 +34,7 @@ async function main(): Promise<void> {
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);
   console.log(`Instructions: ${describeWorkspaceInstructions(runtime.workspaceInstructions)}`);
-  console.log("输入 /exit 退出。\n");
+  console.log("输入 /help 查看命令，输入 /exit 退出。\n");
 
   // 使用 readline/promises 实现最小 REPL。
   // 这里不引入 commander/yargs，是为了让 MVP 依赖和控制流保持可读。
@@ -37,8 +47,32 @@ async function main(): Promise<void> {
       if (line.length === 0) {
         continue;
       }
-      if (line === "/exit") {
-        break;
+      const command = parseCliCommand(line);
+      if (command) {
+        if (!isCliCommandName(command.name)) {
+          output.write(`[命令] 未知命令 /${command.name || ""}，输入 /help 查看帮助。\n\n`);
+          continue;
+        }
+        if (command.argument.length > 0) {
+          output.write(`[命令] /${command.name} 不接受参数。\n\n`);
+          continue;
+        }
+        if (command.name === "exit") break;
+
+        try {
+          await executeCliCommand(command.name, {
+            agent,
+            config,
+            sessionId,
+            instructions: describeWorkspaceInstructions(runtime.workspaceInstructions),
+            rl,
+          });
+        } catch (error) {
+          // 命令失败和普通轮次失败一样不退出 REPL，避免一次摘要或磁盘错误终止会话。
+          console.error(formatRuntimeError(error));
+          output.write("\n");
+        }
+        continue;
       }
 
       const renderer = createTurnRenderer();
@@ -59,6 +93,64 @@ async function main(): Promise<void> {
     // 无论用户 /exit 还是循环中发生未捕获错误，都释放 stdin 和进程事件监听。
     rl.close();
   }
+}
+
+interface CliCommandContext {
+  agent: AgentLoop;
+  config: RuntimeConfig;
+  sessionId: string;
+  instructions: string;
+  rl: Interface;
+}
+
+async function executeCliCommand(
+  command: Exclude<CliCommandName, "exit">,
+  context: CliCommandContext,
+): Promise<void> {
+  if (command === "help") {
+    output.write(`${CLI_HELP_TEXT}\n\n`);
+    return;
+  }
+
+  if (command === "status") {
+    output.write(`[状态]
+Session: ${context.sessionId}
+Provider: ${context.config.providerName}
+Model: ${context.config.model}
+Workspace: ${context.config.workspaceRoot}
+Instructions: ${context.instructions}\n\n`);
+    return;
+  }
+
+  if (command === "history") {
+    const history = await loadSessionHistory(context.config, context.sessionId);
+    output.write(`${formatSessionHistory(history)}\n\n`);
+    return;
+  }
+
+  if (command === "compact") {
+    const renderer = createTurnRenderer();
+    try {
+      const result = await context.agent.compactContext(renderer.handle);
+      if (!result) {
+        output.write("[会话] 没有可压缩的早期历史；需超过保留轮次数。\n");
+      }
+    } finally {
+      renderer.finish();
+    }
+    return;
+  }
+
+  // /clear 是不可恢复操作，仍沿用工具确认的安全默认值：仅 y/yes 继续。
+  const answer = (await context.rl.question(
+    `确认清空 Session ${context.sessionId} 的全部历史？[y/N] `,
+  )).trim().toLowerCase();
+  if (answer !== "y" && answer !== "yes") {
+    output.write("[会话] 已取消清空。\n\n");
+    return;
+  }
+  await context.agent.clearHistory();
+  output.write(`[会话] Session ${context.sessionId} 的历史已清空。\n\n`);
 }
 
 function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: () => void } {

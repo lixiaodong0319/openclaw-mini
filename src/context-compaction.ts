@@ -26,10 +26,10 @@ export interface ContextCompactionOptions {
   summaryMaxTokens: number;
 }
 
-// 32k 留出了系统提示词、工具 schema、最近对话和新输出的空间。
+// 320k 适合长时间连续会话，同时仍为系统提示词、工具 schema 和新输出预留空间。
 // 保留 4 轮可以让模型继续处理短期任务，同时把更早的重复细节收敛进摘要。
 export const DEFAULT_CONTEXT_COMPACTION_OPTIONS: ContextCompactionOptions = {
-  tokenThreshold: 32_000,
+  tokenThreshold: 320_000,
   keepRecentTurns: 4,
   summaryMaxTokens: 2_000,
 };
