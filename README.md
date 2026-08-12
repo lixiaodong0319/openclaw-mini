@@ -11,7 +11,7 @@
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
 - 启动时读取 `workspace/AGENTS.md`，作为 CLI 与 Web 共用的工作区指令
-- 十三个最小工具：
+- 十三个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
   - `find_files`：按 glob 递归查找 `workspace/` 内的文件路径
@@ -23,6 +23,7 @@
   - `write_text_file`：确认后创建或覆盖 `workspace/` 内的 UTF-8 文本文件
   - `edit_text_file`：确认后精确替换现有文本文件中的唯一内容块
   - `apply_patch`：确认后用统一补丁新增或更新一个或多个文件
+  - `web_search`：OpenAI 模式下由 Responses API 原生搜索公网信息
   - `fetch_url`：确认后读取公网 HTTP/HTTPS URL 的文本内容
   - `run_command`：确认后从 `workspace/` 启动 Shell 命令，用于构建、测试和代码检查
 - JSONL 会话持久化，支持重启后继续同一 session
@@ -36,7 +37,7 @@
 - OpenClaw Gateway / daemon
 - Slack、Discord、Telegram 等消息渠道
 - 文件删除或重命名工具
-- 浏览器、网络搜索、MCP、多 Agent、记忆系统
+- 浏览器、MCP、多 Agent、记忆系统
 - 模型 fallback、成本路由
 
 ## 目录结构
@@ -277,6 +278,7 @@ pnpm dev -- --session demo
 > 把 config.txt 中的 port=3000 改成 port=8080
 > 用一个补丁同时修改 config.txt 和 README.md
 > 查看当前 Git 状态和 src/tools.ts 的未暂存差异
+> 搜索 OpenAI Responses API 最近的更新，并列出来源
 > 获取 https://example.com/data.json 并总结内容
 > 运行 pnpm test 并分析失败原因
 ```
@@ -286,6 +288,8 @@ pnpm dev -- --session demo
 `apply_patch` 使用 `*** Begin Patch` / `*** End Patch` 格式，支持 `*** Add File:` 和 `*** Update File:`，同一更新文件可以包含多个 `@@` hunk。第一版不支持删除文件；新增文件的父目录必须已经存在。所有路径和 hunk 会在写盘前统一校验，任一上下文缺失或重复时整批拒绝。单个补丁和每个补丁结果文件最大均为 1 MiB。
 
 `git_status` 和 `git_diff` 只允许检查顶层目录位于 `workspace/` 内的非裸 Git 仓库。它们直接启动 Git 而不经过 Shell，并关闭 pager、外部 diff、textconv、fsmonitor、全局/系统配置和可选索引写锁。`git_diff` 默认最多返回 64 KiB，最高可请求 256 KiB；可指定一个仓库相对文件，也可查看全部暂存或未暂存差异。
+
+`web_search` 仅在 `OPENCLAW_PROVIDER=openai` 时启用，直接作为 `{ "type": "web_search" }` 传给 OpenAI Responses API。搜索由 OpenAI 在模型响应内部执行，不需要 Brave Key，也不经过本地工具确认；鉴权仍使用现有的 `OPENAI_API_KEY`。Anthropic Messages API 没有复用这项 OpenAI 原生能力。
 
 `fetch_url` 只接受不含用户名密码的公网 HTTP/HTTPS URL，每次调用都需确认。它会解析并检查全部 DNS 地址，把连接固定到已验证的公网 IP，并对每次重定向重新验证，以阻止 localhost、内网、链路本地、云元数据地址和 DNS rebinding。请求总超时 15 秒，最多跟随 5 次重定向；只接受 UTF-8/ASCII 文本、JSON、XML 等文本响应，不携带 Cookie 或 API Key，也不使用系统代理。正文默认最多返回 64 KiB，最高 256 KiB。
 
@@ -314,7 +318,7 @@ pnpm test         运行测试
 
 ## 安全边界
 
-当前版本暴露七个自动放行工具，以及一个目录创建工具、三个文件修改工具、一个需确认的公网文本读取工具和一个每次都需确认的 Shell 工具。模型无法控制浏览器；文件工具无法读写 workspace 外文件。
+当前版本暴露七个自动放行工具，以及六个每次都需确认的目录创建、文件修改、网络和 Shell 工具。OpenAI 模式还启用由 Responses API 托管的原生 Web Search。模型无法控制浏览器；文件工具无法读写 workspace 外文件。
 
 工具权限采用安全默认值：已登记的纯计算和只读工具自动放行，所有未登记工具都必须经过用户确认。拒绝后不会调用工具实现，而是把拒绝结果回填给模型，让模型继续回复。
 
@@ -362,6 +366,7 @@ pnpm run build
 - 多文件补丁、新增文件、多 hunk、换行保留、预检失败零落盘和路径边界
 - Git 分支/文件状态、暂存/未暂存差异、UTF-8 截断和仓库边界
 - HTTP/HTTPS 文本获取、逐跳重定向校验、SSRF 地址阻断、字符集和大小限制
+- OpenAI Responses API 原生 Web Search 工具注入与本地函数工具隔离
 - Shell 命令的工作目录、退出码、超时、输出截断和敏感环境变量清理
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic/OpenAI 会话历史统一展示与内部数据过滤

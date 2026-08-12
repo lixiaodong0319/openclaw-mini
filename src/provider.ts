@@ -325,7 +325,7 @@ export interface OpenAIResponseCreateParams {
   model: string;
   instructions: string;
   input: OpenAIInputItem[];
-  tools: OpenAIToolDefinition[];
+  tools: Array<OpenAIToolDefinition | { type: "web_search" }>;
   max_output_tokens?: number;
 }
 
@@ -489,7 +489,9 @@ export class OpenAIProvider implements AgentProvider {
       model: this.model,
       instructions,
       input: this.input,
-      tools: openAIToolDefinitions,
+      // Web Search 是 Responses API 托管的内置工具；它不进入本地 AgentLoop
+      // 的 function_call 确认和 executeTool 分发，也不影响 Anthropic 工具清单。
+      tools: [...openAIToolDefinitions, { type: "web_search" }],
     };
     const response = onTextDelta && this.client.streamResponse
       ? await this.client.streamResponse(params, onTextDelta)

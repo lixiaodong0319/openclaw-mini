@@ -70,6 +70,17 @@ describe("OpenAIProvider adapter", () => {
     expect(persisted).toHaveLength(2);
   });
 
+  it("enables the Responses API built-in web search tool", async () => {
+    const client = new FakeOpenAIProvider([openAIResponse([outputMessage("current answer")])]);
+    const loop = createLoop(client, [], workspaceRoot);
+
+    await loop.runTurn("search the web");
+
+    expect(client.calls[0]?.tools).toContainEqual({ type: "web_search" });
+    expect(client.calls[0]?.tools.some((tool) => tool.type === "function" && tool.name === "web_search"))
+      .toBe(false);
+  });
+
   it("forwards Responses API text deltas", async () => {
     const client = new FakeOpenAIProvider(
       [openAIResponse([outputMessage("hello")])],
