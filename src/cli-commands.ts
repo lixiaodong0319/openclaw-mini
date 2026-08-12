@@ -1,14 +1,16 @@
 import type { HistoryEntry, SessionHistoryView } from "./session-history.js";
+import type { McpStatusView } from "./mcp.js";
 
 export const CLI_HELP_TEXT = `内置命令:
   /help     查看命令帮助
   /status   查看当前运行配置
   /history  查看当前 Session 的安全历史视图
+  /mcp      查看已连接的 MCP Server 和工具
   /compact  手动压缩早期会话历史
   /clear    清空当前 Session 历史（需要确认）
   /exit     退出`;
 
-export type CliCommandName = "help" | "status" | "history" | "compact" | "clear" | "exit";
+export type CliCommandName = "help" | "status" | "history" | "mcp" | "compact" | "clear" | "exit";
 
 export interface ParsedCliCommand {
   name: string;
@@ -19,6 +21,7 @@ const CLI_COMMAND_NAMES = new Set<CliCommandName>([
   "help",
   "status",
   "history",
+  "mcp",
   "compact",
   "clear",
   "exit",
@@ -53,6 +56,25 @@ export function formatSessionHistory(history: SessionHistoryView): string {
   return blocks.join("\n\n");
 }
 
+export function formatMcpStatus(status: McpStatusView): string {
+  if (status.serverCount === 0) {
+    return "[MCP] 未连接 Server；请在项目根目录配置 mcp.json 后重启。";
+  }
+
+  const blocks = [`[MCP] ${status.serverCount} server(s), ${status.toolCount} tool(s)`];
+  for (const server of status.servers) {
+    blocks.push(`\n[Server] ${server.name}（${server.tools.length} tools）`);
+    if (server.tools.length === 0) {
+      blocks.push("  （没有发现工具）");
+      continue;
+    }
+    for (const tool of server.tools) {
+      blocks.push(`  - ${tool.name}\n    ${limitDescription(tool.description)}`);
+    }
+  }
+  return blocks.join("\n");
+}
+
 function formatHistoryEntry(entry: HistoryEntry): string {
   if (entry.type === "message") {
     return `[${entry.role === "user" ? "用户" : "助手"}] ${limitText(entry.text)}`;
@@ -73,4 +95,9 @@ function limitText(text: string): string {
   return text.length <= maxLength
     ? text
     : `${text.slice(0, maxLength)}\n...（单条历史已截断）`;
+}
+
+function limitDescription(description: string): string {
+  const normalized = description.replace(/\s+/g, " ").trim();
+  return normalized.length <= 240 ? normalized : `${normalized.slice(0, 240)}...`;
 }

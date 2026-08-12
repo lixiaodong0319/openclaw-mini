@@ -1,5 +1,6 @@
 import {
   CLI_HELP_TEXT,
+  formatMcpStatus,
   formatSessionHistory,
   isCliCommandName,
   parseCliCommand,
@@ -14,11 +15,42 @@ describe("CLI commands", () => {
   });
 
   it("recognizes every documented command", () => {
-    for (const name of ["help", "status", "history", "compact", "clear", "exit"]) {
+    for (const name of ["help", "status", "history", "mcp", "compact", "clear", "exit"]) {
       expect(isCliCommandName(name)).toBe(true);
       expect(CLI_HELP_TEXT).toContain(`/${name}`);
     }
     expect(isCliCommandName("unknown")).toBe(false);
+  });
+
+  it("formats MCP servers and tools for terminal display", () => {
+    const output = formatMcpStatus({
+      serverCount: 2,
+      toolCount: 2,
+      servers: [
+        {
+          name: "filesystem",
+          tools: [{
+            name: "mcp__filesystem__read_file",
+            description: "[MCP server: filesystem] Read a file.",
+          }],
+        },
+        {
+          name: "empty",
+          tools: [],
+        },
+      ],
+    });
+
+    expect(output).toContain("[MCP] 2 server(s), 2 tool(s)");
+    expect(output).toContain("[Server] filesystem（1 tools）");
+    expect(output).toContain("mcp__filesystem__read_file");
+    expect(output).toContain("[Server] empty（0 tools）");
+    expect(output).toContain("没有发现工具");
+  });
+
+  it("formats an empty MCP status", () => {
+    expect(formatMcpStatus({ serverCount: 0, toolCount: 0, servers: [] }))
+      .toContain("未连接 Server");
   });
 
   it("formats the safe history view for terminal display", () => {

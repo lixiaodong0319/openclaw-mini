@@ -7,6 +7,7 @@ import {
 } from "./agent-loop.js";
 import {
   CLI_HELP_TEXT,
+  formatMcpStatus,
   formatSessionHistory,
   isCliCommandName,
   parseCliCommand,
@@ -20,6 +21,7 @@ import {
 } from "./runtime.js";
 import { loadSessionHistory } from "./session-history.js";
 import { describeWorkspaceInstructions } from "./workspace-instructions.js";
+import type { McpManager } from "./mcp.js";
 
 async function main(): Promise<void> {
   // CLI 参数目前只解析 --session，保持入口足够小。
@@ -66,6 +68,7 @@ async function main(): Promise<void> {
             config,
             sessionId,
             instructions: describeWorkspaceInstructions(runtime.workspaceInstructions),
+            mcp: runtime.mcp,
             rl,
           });
         } catch (error) {
@@ -102,6 +105,7 @@ interface CliCommandContext {
   config: RuntimeConfig;
   sessionId: string;
   instructions: string;
+  mcp: McpManager;
   rl: Interface;
 }
 
@@ -127,6 +131,11 @@ Instructions: ${context.instructions}\n\n`);
   if (command === "history") {
     const history = await loadSessionHistory(context.config, context.sessionId);
     output.write(`${formatSessionHistory(history)}\n\n`);
+    return;
+  }
+
+  if (command === "mcp") {
+    output.write(`${formatMcpStatus(context.mcp.getStatus())}\n\n`);
     return;
   }
 

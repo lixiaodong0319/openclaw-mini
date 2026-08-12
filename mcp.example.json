@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "workspace"
+      ],
+      "timeoutMs": 30000
+    },
+    "remote-example": {
+      "transport": "streamable-http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "X-Tenant-ID": "demo"
+      },
+      "token": "replace-me",
+      "timeoutMs": 15000,
+      "enabled": false
+    }
+  }
+}

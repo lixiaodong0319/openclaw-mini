@@ -6,22 +6,38 @@ import {
   StdioClientTransport,
   getDefaultEnvironment,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { OpenAIToolDefinition } from "./tools.js";
 
 const MCP_CONFIG_FILE = "mcp.json";
-const MCP_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_MCP_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_MCP_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_MCP_TOOLS = 200;
 const MAX_EXPOSED_TOOL_NAME_CHARACTERS = 64;
 const MAX_MCP_RESULT_BYTES = 256 * 1024;
 
-interface McpServerConfig {
+interface McpBaseServerConfig {
+  enabled: boolean;
+  timeoutMs: number;
+}
+
+interface McpStdioServerConfig extends McpBaseServerConfig {
+  transport: "stdio";
   command: string;
   args: string[];
   cwd?: string;
   env: Record<string, string>;
-  enabled: boolean;
 }
+
+interface McpStreamableHttpServerConfig extends McpBaseServerConfig {
+  transport: "streamable-http";
+  url: string;
+  headers: Record<string, string>;
+  token?: string;
+}
+
+type McpServerConfig = McpStdioServerConfig | McpStreamableHttpServerConfig;
 
 interface McpToolClient {
   listTools(params?: { cursor?: string }, options?: { timeout?: number }): Promise<{
@@ -56,6 +72,8 @@ interface RegisteredMcpTool {
   description: string;
   inputSchema: Record<string, unknown>;
   client: McpToolClient;
+  timeoutMs: number;
+  sensitiveValues: string[];
 }
 
 export interface McpToolDefinitions {
@@ -63,11 +81,24 @@ export interface McpToolDefinitions {
   openai: OpenAIToolDefinition[];
 }
 
+export interface McpStatusView {
+  serverCount: number;
+  toolCount: number;
+  servers: Array<{
+    name: string;
+    tools: Array<{
+      name: string;
+      description: string;
+    }>;
+  }>;
+}
+
 // McpManager 是运行期 MCP 连接和动态工具定义的唯一所有者。
 // AgentLoop 仍只看到普通工具名和字符串结果，不依赖 MCP SDK。
 export class McpManager {
   private readonly tools = new Map<string, RegisteredMcpTool>();
   private readonly connections: McpConnection[] = [];
+  private readonly serverNames: string[] = [];
 
   static async load(
     projectRoot: string,
@@ -76,7 +107,7 @@ export class McpManager {
     const manager = new McpManager();
     const config = await loadMcpConfig(projectRoot);
     const dependencies: McpDependencies = {
-      connect: connectStdioServer,
+      connect: connectMcpServer,
       ...dependencyOverrides,
     };
 
@@ -85,7 +116,21 @@ export class McpManager {
         if (!serverConfig.enabled) continue;
         const connection = await dependencies.connect(serverName, serverConfig, projectRoot);
         manager.connections.push(connection);
-        await manager.registerServerTools(serverName, connection.client);
+        manager.serverNames.push(serverName);
+        try {
+          await manager.registerServerTools(
+            serverName,
+            connection.client,
+            serverConfig,
+          );
+        } catch (error) {
+          throw new Error(
+            `Failed to load MCP tools from ${serverName}: ${sanitizeSensitiveText(
+              errorMessage(error),
+              getSensitiveValues(serverConfig),
+            )}`,
+          );
+        }
       }
       return manager;
     } catch (error) {
@@ -104,6 +149,25 @@ export class McpManager {
 
   hasTool(name: string): boolean {
     return this.tools.has(name);
+  }
+
+  // CLI 只读取这个安全快照，不暴露 MCP client、启动命令、环境变量或远端原始名称。
+  getStatus(): McpStatusView {
+    const tools = [...this.tools.values()];
+    return {
+      serverCount: this.serverCount,
+      toolCount: this.toolCount,
+      servers: this.serverNames.map((serverName) => ({
+        name: serverName,
+        tools: tools
+          .filter((tool) => tool.serverName === serverName)
+          .map((tool) => ({
+            name: tool.exposedName,
+            description: tool.description,
+          }))
+          .sort((left, right) => left.name.localeCompare(right.name)),
+      })),
+    };
   }
 
   getDefinitions(): McpToolDefinitions {
@@ -129,29 +193,46 @@ export class McpManager {
     if (!tool) throw new Error(`Unknown MCP tool: ${name}`);
     if (!isRecord(input)) throw new Error(`MCP tool ${name} requires an object input`);
 
-    const result = await tool.client.callTool(
-      { name: tool.remoteName, arguments: input },
-      undefined,
-      { timeout: MCP_REQUEST_TIMEOUT_MS },
-    );
-    const formatted = limitUtf8Text(formatMcpToolResult(result), MAX_MCP_RESULT_BYTES);
-    if (isRecord(result) && result.isError === true) {
-      throw new Error(formatted || `MCP tool ${name} failed`);
+    let result: unknown;
+    try {
+      result = await tool.client.callTool(
+        { name: tool.remoteName, arguments: input },
+        undefined,
+        { timeout: tool.timeoutMs },
+      );
+    } catch (error) {
+      throw new Error(
+        `MCP tool ${name} failed: ${sanitizeSensitiveText(errorMessage(error), tool.sensitiveValues)}`,
+      );
     }
-    return formatted;
+    const formatted = sanitizeSensitiveText(
+      formatMcpToolResult(result),
+      tool.sensitiveValues,
+    );
+    const limited = limitUtf8Text(formatted, MAX_MCP_RESULT_BYTES);
+    if (isRecord(result) && result.isError === true) {
+      throw new Error(limited || `MCP tool ${name} failed`);
+    }
+    return limited;
   }
 
   async close(): Promise<void> {
     const connections = this.connections.splice(0).reverse();
+    this.serverNames.splice(0);
     this.tools.clear();
     await Promise.allSettled(connections.map((connection) => connection.close()));
   }
 
-  private async registerServerTools(serverName: string, client: McpToolClient): Promise<void> {
+  private async registerServerTools(
+    serverName: string,
+    client: McpToolClient,
+    serverConfig: McpServerConfig,
+  ): Promise<void> {
+    const sensitiveValues = getSensitiveValues(serverConfig);
     let cursor: string | undefined;
     do {
       const page = await client.listTools(cursor ? { cursor } : undefined, {
-        timeout: MCP_REQUEST_TIMEOUT_MS,
+        timeout: serverConfig.timeoutMs,
       });
       for (const tool of page.tools) {
         if (this.tools.size >= MAX_MCP_TOOLS) {
@@ -171,6 +252,8 @@ export class McpManager {
           description: `[MCP server: ${serverName}] ${tool.description?.trim() || tool.name}`,
           inputSchema: tool.inputSchema,
           client,
+          timeoutMs: serverConfig.timeoutMs,
+          sensitiveValues,
         });
       }
       cursor = page.nextCursor;
@@ -209,7 +292,50 @@ async function loadMcpConfig(projectRoot: string): Promise<Record<string, McpSer
 }
 
 function parseServerConfig(name: string, value: unknown): McpServerConfig {
-  if (!isRecord(value) || typeof value.command !== "string" || value.command.trim().length === 0) {
+  if (!isRecord(value)) {
+    throw new Error(`MCP server ${name} must be an object`);
+  }
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new Error(`MCP server ${name} enabled must be a boolean`);
+  }
+  const enabled = value.enabled ?? true;
+  const timeoutMs = parseTimeoutMs(name, value.timeoutMs);
+  const hasCommand = value.command !== undefined;
+  const hasUrl = value.url !== undefined;
+  if (hasCommand && hasUrl) {
+    throw new Error(`MCP server ${name} cannot contain both command and url`);
+  }
+
+  const inferredTransport = hasUrl ? "streamable-http" : "stdio";
+  const transport = value.transport ?? inferredTransport;
+  if (transport !== "stdio" && transport !== "streamable-http") {
+    throw new Error(`MCP server ${name} transport must be stdio or streamable-http`);
+  }
+  if (transport === "streamable-http") {
+    if (hasCommand) {
+      throw new Error(`MCP server ${name} streamable-http transport cannot contain command`);
+    }
+    if (value.args !== undefined || value.cwd !== undefined || value.env !== undefined) {
+      throw new Error(`MCP server ${name} streamable-http transport cannot contain stdio fields`);
+    }
+    return parseStreamableHttpConfig(name, value, enabled, timeoutMs);
+  }
+  if (hasUrl) {
+    throw new Error(`MCP server ${name} stdio transport cannot contain url`);
+  }
+  if (value.headers !== undefined || value.token !== undefined) {
+    throw new Error(`MCP server ${name} stdio transport cannot contain HTTP fields`);
+  }
+  return parseStdioConfig(name, value, enabled, timeoutMs);
+}
+
+function parseStdioConfig(
+  name: string,
+  value: Record<string, unknown>,
+  enabled: boolean,
+  timeoutMs: number,
+): McpStdioServerConfig {
+  if (typeof value.command !== "string" || value.command.trim().length === 0) {
     throw new Error(`MCP server ${name} requires a non-empty command`);
   }
   const args = value.args ?? [];
@@ -219,25 +345,110 @@ function parseServerConfig(name: string, value: unknown): McpServerConfig {
   if (value.cwd !== undefined && typeof value.cwd !== "string") {
     throw new Error(`MCP server ${name} cwd must be a string`);
   }
-  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
-    throw new Error(`MCP server ${name} enabled must be a boolean`);
-  }
   const env = value.env ?? {};
   if (!isRecord(env) || Object.values(env).some((entry) => typeof entry !== "string")) {
     throw new Error(`MCP server ${name} env must contain only string values`);
   }
   return {
+    transport: "stdio",
     command: value.command.trim(),
     args: [...args],
     cwd: value.cwd,
     env: env as Record<string, string>,
-    enabled: value.enabled ?? true,
+    enabled,
+    timeoutMs,
   };
+}
+
+function parseStreamableHttpConfig(
+  name: string,
+  value: Record<string, unknown>,
+  enabled: boolean,
+  timeoutMs: number,
+): McpStreamableHttpServerConfig {
+  if (typeof value.url !== "string" || value.url.trim().length === 0) {
+    throw new Error(`MCP server ${name} requires a non-empty url`);
+  }
+  let url: URL;
+  try {
+    url = new URL(value.url.trim());
+  } catch {
+    throw new Error(`MCP server ${name} url must be an absolute HTTP(S) URL`);
+  }
+  if ((url.protocol !== "http:" && url.protocol !== "https:") || !url.hostname) {
+    throw new Error(`MCP server ${name} url must be an absolute HTTP(S) URL`);
+  }
+  if (url.username || url.password) {
+    throw new Error(`MCP server ${name} url must not contain embedded credentials`);
+  }
+
+  const rawHeaders = value.headers ?? {};
+  if (!isRecord(rawHeaders) || Object.values(rawHeaders).some((entry) => typeof entry !== "string")) {
+    throw new Error(`MCP server ${name} headers must contain only string values`);
+  }
+  const headers = rawHeaders as Record<string, string>;
+  try {
+    // Headers 会校验非法名称，以及包含 CR/LF 等不能安全发送的值。
+    new Headers(headers);
+  } catch {
+    throw new Error(`MCP server ${name} headers contain an invalid name or value`);
+  }
+  for (const headerName of Object.keys(headers)) {
+    if (isReservedHttpHeader(headerName)) {
+      throw new Error(`MCP server ${name} cannot configure reserved header ${headerName}`);
+    }
+  }
+  if (value.token !== undefined && (typeof value.token !== "string" || value.token.trim().length === 0)) {
+    throw new Error(`MCP server ${name} token must be a non-empty string`);
+  }
+  const authorizationHeader = Object.keys(headers)
+    .find((headerName) => headerName.toLowerCase() === "authorization");
+  if (value.token !== undefined && authorizationHeader !== undefined) {
+    throw new Error(`MCP server ${name} cannot configure both token and Authorization header`);
+  }
+
+  return {
+    transport: "streamable-http",
+    url: url.toString(),
+    headers: { ...headers },
+    token: value.token?.trim(),
+    enabled,
+    timeoutMs,
+  };
+}
+
+function parseTimeoutMs(name: string, value: unknown): number {
+  const timeoutMs = value ?? DEFAULT_MCP_REQUEST_TIMEOUT_MS;
+  if (!Number.isInteger(timeoutMs) || (timeoutMs as number) <= 0 || (timeoutMs as number) > MAX_MCP_REQUEST_TIMEOUT_MS) {
+    throw new Error(
+      `MCP server ${name} timeoutMs must be an integer between 1 and ${MAX_MCP_REQUEST_TIMEOUT_MS}`,
+    );
+  }
+  return timeoutMs as number;
+}
+
+function isReservedHttpHeader(name: string): boolean {
+  const normalized = name.toLowerCase();
+  return normalized === "host"
+    || normalized === "content-length"
+    || normalized === "mcp-session-id"
+    || normalized === "mcp-protocol-version";
+}
+
+async function connectMcpServer(
+  serverName: string,
+  config: McpServerConfig,
+  projectRoot: string,
+): Promise<McpConnection> {
+  if (config.transport === "stdio") {
+    return connectStdioServer(serverName, config, projectRoot);
+  }
+  return connectStreamableHttpServer(serverName, config);
 }
 
 async function connectStdioServer(
   serverName: string,
-  config: McpServerConfig,
+  config: McpStdioServerConfig,
   projectRoot: string,
 ): Promise<McpConnection> {
   const client = new Client({ name: "openclaw-mini", version: "1.0.0" });
@@ -249,7 +460,7 @@ async function connectStdioServer(
     stderr: "inherit",
   });
   try {
-    await client.connect(transport, { timeout: MCP_REQUEST_TIMEOUT_MS });
+    await client.connect(transport, { timeout: config.timeoutMs });
   } catch (error) {
     await transport.close().catch(() => undefined);
     throw new Error(`Failed to connect MCP server ${serverName}: ${error instanceof Error ? error.message : String(error)}`);
@@ -258,6 +469,48 @@ async function connectStdioServer(
     client,
     close: () => client.close(),
   };
+}
+
+async function connectStreamableHttpServer(
+  serverName: string,
+  config: McpStreamableHttpServerConfig,
+): Promise<McpConnection> {
+  const client = new Client({ name: "openclaw-mini", version: "1.0.0" });
+  const headers: Record<string, string> = { ...config.headers };
+  if (config.token) headers.Authorization = `Bearer ${config.token}`;
+  const transport = new StreamableHTTPClientTransport(new URL(config.url), {
+    requestInit: { headers },
+  });
+  try {
+    await client.connect(transport, { timeout: config.timeoutMs });
+  } catch (error) {
+    await transport.close().catch(() => undefined);
+    throw new Error(
+      `Failed to connect MCP server ${serverName}: ${sanitizeSensitiveText(errorMessage(error), getSensitiveValues(config))}`,
+    );
+  }
+  return {
+    client,
+    close: () => client.close(),
+  };
+}
+
+function getSensitiveValues(config: McpServerConfig): string[] {
+  if (config.transport === "stdio") return [];
+  return [config.url, config.token, ...Object.values(config.headers)]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .sort((left, right) => right.length - left.length);
+}
+
+function sanitizeSensitiveText(text: string, sensitiveValues: string[]): string {
+  // 远程 Server 可能在响应或错误中回显 URL/Header，写入终端和会话前统一脱敏。
+  let message = text;
+  for (const value of sensitiveValues) message = message.split(value).join("[redacted]");
+  return message;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatMcpToolResult(result: unknown): string {

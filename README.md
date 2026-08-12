@@ -11,7 +11,7 @@
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
 - 启动时读取 `workspace/AGENTS.md`，作为 CLI 与 Web 共用的工作区指令
-- 从项目根目录的 `mcp.json` 连接 stdio MCP Server，并动态加载工具
+- 从项目根目录的 `mcp.json` 连接 stdio 或 Streamable HTTP MCP Server，并动态加载工具
 - 十三个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
@@ -52,7 +52,7 @@ src/
   context-compaction.ts 上下文估算、压缩阈值和保留策略
   fetch-url.ts       公网文本请求、DNS 固定和 SSRF 防护
   git-tools.ts       只读 Git 状态、差异和进程安全边界
-  mcp.ts             MCP 配置、stdio 连接、工具发现与调用适配
+  mcp.ts             MCP 配置、stdio/HTTP 连接、工具发现与调用适配
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
   session-history.ts 两种 Provider 原生历史到安全展示视图的转换
@@ -126,12 +126,13 @@ OpenAI Provider 也支持 `OPENAI_MODEL`，但 `OPENCLAW_MODEL` 优先级更高�
 
 ### MCP 配置
 
-复制项目中的 `mcp.example.json` 为根目录下的 `mcp.json`。当前支持 stdio MCP Server；没有这个文件时不会启动 MCP，也不影响普通工具。本地 `mcp.json` 已加入 `.gitignore`，避免其中的凭据被误提交：
+复制项目中的 `mcp.example.json` 为根目录下的 `mcp.json`。支持本地 stdio 和远程 Streamable HTTP MCP Server；没有这个文件时不会启动 MCP，也不影响普通工具。本地 `mcp.json` 已加入 `.gitignore`，避免其中的凭据被误提交：
 
 ```json
 {
   "mcpServers": {
     "filesystem": {
+      "transport": "stdio",
       "command": "npx",
       "args": [
         "-y",
@@ -149,23 +150,46 @@ OpenAI Provider 也支持 `OPENAI_MODEL`，但 `OPENCLAW_MODEL` 优先级更高�
 MCP: 1 server(s), 14 tool(s)
 ```
 
-MCP 工具以 `mcp__服务名__工具名` 暴露给模型，例如 `mcp__filesystem__read_file`；不兼容厂商命名限制的名称会被安全清洗并附加短哈希。为避免第三方 Server 未声明或错误声明副作用，所有 MCP 工具默认都需要人工确认。单次工具结果最多回填 256 KiB，图片和音频二进制不会写入文本会话。配置还支持可选的 `args`、`cwd`、`env` 和 `enabled` 字段：
+MCP 工具以 `mcp__服务名__工具名` 暴露给模型，例如 `mcp__filesystem__read_file`；不兼容厂商命名限制的名称会被安全清洗并附加短哈希。为避免第三方 Server 未声明或错误声明副作用，所有 MCP 工具默认都需要人工确认。单次工具结果最多回填 256 KiB，图片和音频二进制不会写入文本会话。stdio 配置支持可选的 `args`、`cwd`、`env`、`enabled` 和 `timeoutMs` 字段：
 
 ```json
 {
   "mcpServers": {
     "demo": {
+      "transport": "stdio",
       "command": "node",
       "args": ["tools/demo-mcp.js"],
       "cwd": ".",
       "env": { "DEMO_MODE": "local" },
+      "enabled": true,
+      "timeoutMs": 30000
+    }
+  }
+}
+```
+
+Streamable HTTP 示例：
+
+```json
+{
+  "mcpServers": {
+    "remote": {
+      "transport": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "X-Tenant-ID": "demo"
+      },
+      "token": "your-bearer-token",
+      "timeoutMs": 15000,
       "enabled": true
     }
   }
 }
 ```
 
-`command` 会直接启动进程，不经过 Shell；`cwd` 相对于项目根目录解析。修改配置后需要重启 CLI/Web。CLI 和 Web 退出时会关闭 MCP Server；Web 的多个 Session 共享连接，不会为每个 Session 重复启动进程。
+`token` 会转成 `Authorization: Bearer ...`；如果服务使用其他认证方式，也可直接在 `headers` 里配置 `Authorization`，但不能与 `token` 同时使用。`timeoutMs` 是连接、发现工具和调用工具的单次请求超时，默认 30000 ms，范围 1–120000 ms。请只连接你信任的 URL，自定义请求头会随每个 MCP HTTP 请求发送。
+
+不写 `transport` 时，存在 `command` 会按 stdio 处理，存在 `url` 会按 Streamable HTTP 处理，因此原有 stdio 配置无需修改。`command` 会直接启动进程，不经过 Shell；`cwd` 相对于项目根目录解析。修改配置后需要重启 CLI/Web。CLI 和 Web 退出时会关闭 MCP 连接；Web 的多个 Session 共享连接，不会为每个 Session 重复连接。`/mcp` 只显示 Server 名和工具，不显示 URL、Header 或 Token。
 
 ### 工作区指令
 
@@ -229,12 +253,15 @@ pnpm dev -- --session smoke
 /help       查看命令帮助
 /status     查看当前 Provider、模型、Session、workspace 和指令状态
 /history    查看当前 Session 的安全历史视图
+/mcp        查看已连接的 MCP Server 和工具
 /compact    手动压缩早期会话历史
 /clear      清空当前 Session 历史（需要确认）
 /exit       退出
 ```
 
 未知的 `/命令` 不会发送给模型。内置命令目前不接受参数，命令名不区分大小写。
+
+`/mcp` 显示启动时已经连接的 Server，并按 Server 分组列出模型实际可见的 MCP 工具名称和描述。它不会重新启动 Server、重新发现工具或执行工具，也不会展示 `mcp.json` 中的命令、环境变量和凭据。
 
 `/history` 与 Web 使用相同的安全历史视图，不展示 OpenAI reasoning、Anthropic thinking、工具参数或工具输出；最多显示 200 项，每条长文本最多显示 2,000 个字符。
 
@@ -413,7 +440,7 @@ pnpm run build
 - Git 分支/文件状态、暂存/未暂存差异、UTF-8 截断和仓库边界
 - HTTP/HTTPS 文本获取、逐跳重定向校验、SSRF 地址阻断、字符集和大小限制
 - OpenAI Responses API 原生 Web Search 工具注入与本地函数工具隔离
-- stdio MCP 配置解析、动态工具发现、双 Provider 定义适配、调用错误和连接关闭
+- stdio/Streamable HTTP MCP 配置解析、动态工具发现、双 Provider 定义适配、调用错误和连接关闭
 - Shell 命令的工作目录、退出码、超时、输出截断和敏感环境变量清理
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic/OpenAI 会话历史统一展示与内部数据过滤
