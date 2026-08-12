@@ -34,6 +34,13 @@ function createLoop(
     maxIterations?: number;
     compaction?: Partial<ContextCompactionOptions>;
     onHistoryReplace?: (items: OpenAIInputItem[]) => Promise<void>;
+    additionalTools?: Array<{
+      type: "function";
+      name: string;
+      description: string;
+      parameters: { type: "object"; properties: Record<string, object>; required: string[] };
+      strict: boolean;
+    }>;
   } = {},
 ): AgentLoop {
   return new AgentLoop({
@@ -44,6 +51,7 @@ function createLoop(
       onItem: options.onItem,
       onHistoryReplace: options.onHistoryReplace,
       compaction: options.compaction,
+      additionalTools: options.additionalTools,
     }),
     toolContext: { workspaceRoot },
     maxIterations: options.maxIterations,
@@ -79,6 +87,30 @@ describe("OpenAIProvider adapter", () => {
     expect(client.calls[0]?.tools).toContainEqual({ type: "web_search" });
     expect(client.calls[0]?.tools.some((tool) => tool.type === "function" && tool.name === "web_search"))
       .toBe(false);
+  });
+
+  it("adds dynamically discovered MCP function tools", async () => {
+    const client = new FakeOpenAIProvider([openAIResponse([outputMessage("done")])]);
+    const loop = createLoop(client, [], workspaceRoot, {
+      additionalTools: [{
+        type: "function",
+        name: "mcp__demo__lookup",
+        description: "MCP lookup",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+        strict: false,
+      }],
+    });
+
+    await loop.runTurn("use MCP");
+
+    expect(client.calls[0]?.tools).toContainEqual(expect.objectContaining({
+      type: "function",
+      name: "mcp__demo__lookup",
+    }));
   });
 
   it("forwards Responses API text deltas", async () => {

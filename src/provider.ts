@@ -40,6 +40,7 @@ export interface AnthropicProviderOptions {
   // 只有压缩成功时使用：宿主需用新历史原子替换旧 JSONL。
   onHistoryReplace?: (messages: Anthropic.MessageParam[]) => Promise<void>;
   compaction?: Partial<ContextCompactionOptions>;
+  additionalTools?: Anthropic.Tool[];
 }
 
 // Anthropic Messages API 适配器。
@@ -51,6 +52,7 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
   private readonly onMessage?: (message: Anthropic.MessageParam) => Promise<void>;
   private readonly onHistoryReplace?: (messages: Anthropic.MessageParam[]) => Promise<void>;
   private readonly compaction: ContextCompactionOptions;
+  private readonly tools: Anthropic.Tool[];
 
   constructor(options?: AnthropicProviderOptions) {
     if (options) {
@@ -60,6 +62,7 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
       this.onMessage = options.onMessage;
       this.onHistoryReplace = options.onHistoryReplace;
       this.compaction = resolveContextCompactionOptions(options.compaction);
+      this.tools = [...toolDefinitions, ...(options.additionalTools ?? [])];
       return;
     }
 
@@ -68,6 +71,7 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
     this.model = getModelId();
     this.messages = [];
     this.compaction = resolveContextCompactionOptions();
+    this.tools = toolDefinitions;
   }
 
   createMessage(params: Anthropic.MessageCreateParamsNonStreaming): Promise<Anthropic.Message> {
@@ -159,7 +163,7 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
       thinking: { type: "adaptive" },
       output_config: { effort: "high" },
       system: [{ type: "text", text: instructions }],
-      tools: toolDefinitions,
+      tools: this.tools,
       messages: normalizeMessages(this.messages),
     };
     const response = onTextDelta && this.client.streamMessage
@@ -354,6 +358,7 @@ export interface OpenAIProviderOptions {
   // 压缩后整体替换 OpenAI namespace 下的 session JSONL。
   onHistoryReplace?: (items: OpenAIInputItem[]) => Promise<void>;
   compaction?: Partial<ContextCompactionOptions>;
+  additionalTools?: OpenAIToolDefinition[];
 }
 
 interface FunctionCallItem extends OpenAIResponseItem {
@@ -404,6 +409,7 @@ export class OpenAIProvider implements AgentProvider {
   private readonly onItem?: (item: OpenAIInputItem) => Promise<void>;
   private readonly onHistoryReplace?: (items: OpenAIInputItem[]) => Promise<void>;
   private readonly compaction: ContextCompactionOptions;
+  private readonly tools: Array<OpenAIToolDefinition | { type: "web_search" }>;
 
   constructor(options: OpenAIProviderOptions) {
     this.client = options.client ?? new OpenAIHTTPClient();
@@ -412,6 +418,9 @@ export class OpenAIProvider implements AgentProvider {
     this.onItem = options.onItem;
     this.onHistoryReplace = options.onHistoryReplace;
     this.compaction = resolveContextCompactionOptions(options.compaction);
+    // Web Search 是 Responses API 托管的内置工具；它不进入本地 AgentLoop
+    // 的 function_call 确认和 executeTool 分发，也不影响 Anthropic 工具清单。
+    this.tools = [...openAIToolDefinitions, ...(options.additionalTools ?? []), { type: "web_search" }];
   }
 
   async compactHistoryIfNeeded(
@@ -489,9 +498,7 @@ export class OpenAIProvider implements AgentProvider {
       model: this.model,
       instructions,
       input: this.input,
-      // Web Search 是 Responses API 托管的内置工具；它不进入本地 AgentLoop
-      // 的 function_call 确认和 executeTool 分发，也不影响 Anthropic 工具清单。
-      tools: [...openAIToolDefinitions, { type: "web_search" }],
+      tools: this.tools,
     };
     const response = onTextDelta && this.client.streamResponse
       ? await this.client.streamResponse(params, onTextDelta)

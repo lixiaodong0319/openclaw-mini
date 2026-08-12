@@ -11,6 +11,7 @@
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
 - 启动时读取 `workspace/AGENTS.md`，作为 CLI 与 Web 共用的工作区指令
+- 从项目根目录的 `mcp.json` 连接 stdio MCP Server，并动态加载工具
 - 十三个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
@@ -37,7 +38,7 @@
 - OpenClaw Gateway / daemon
 - Slack、Discord、Telegram 等消息渠道
 - 文件删除或重命名工具
-- 浏览器、MCP、多 Agent、记忆系统
+- 浏览器、多 Agent、记忆系统
 - 模型 fallback、成本路由
 
 ## 目录结构
@@ -51,6 +52,7 @@ src/
   context-compaction.ts 上下文估算、压缩阈值和保留策略
   fetch-url.ts       公网文本请求、DNS 固定和 SSRF 防护
   git-tools.ts       只读 Git 状态、差异和进程安全边界
+  mcp.ts             MCP 配置、stdio 连接、工具发现与调用适配
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
   session-history.ts 两种 Provider 原生历史到安全展示视图的转换
@@ -70,6 +72,7 @@ test/
   fake-provider.ts       测试用 Fake Provider
   fetch-url.test.ts      URL、重定向、地址和内容边界测试
   git-tools.test.ts      临时 Git 仓库与只读边界测试
+  mcp.test.ts            MCP 配置、工具发现、调用与关闭测试
   session-store.test.ts  会话存储测试
   session-history.test.ts 会话历史展示转换测试
   tools.test.ts          工具边界测试
@@ -120,6 +123,49 @@ export OPENCLAW_MODEL="gpt-5.3-codex"
 ```
 
 OpenAI Provider 也支持 `OPENAI_MODEL`，但 `OPENCLAW_MODEL` 优先级更高。
+
+### MCP 配置
+
+复制项目中的 `mcp.example.json` 为根目录下的 `mcp.json`。当前支持 stdio MCP Server；没有这个文件时不会启动 MCP，也不影响普通工具。本地 `mcp.json` 已加入 `.gitignore`，避免其中的凭据被误提交：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "workspace"
+      ]
+    }
+  }
+}
+```
+
+启动后会显示加载数量，例如：
+
+```text
+MCP: 1 server(s), 14 tool(s)
+```
+
+MCP 工具以 `mcp__服务名__工具名` 暴露给模型，例如 `mcp__filesystem__read_file`；不兼容厂商命名限制的名称会被安全清洗并附加短哈希。为避免第三方 Server 未声明或错误声明副作用，所有 MCP 工具默认都需要人工确认。单次工具结果最多回填 256 KiB，图片和音频二进制不会写入文本会话。配置还支持可选的 `args`、`cwd`、`env` 和 `enabled` 字段：
+
+```json
+{
+  "mcpServers": {
+    "demo": {
+      "command": "node",
+      "args": ["tools/demo-mcp.js"],
+      "cwd": ".",
+      "env": { "DEMO_MODE": "local" },
+      "enabled": true
+    }
+  }
+}
+```
+
+`command` 会直接启动进程，不经过 Shell；`cwd` 相对于项目根目录解析。修改配置后需要重启 CLI/Web。CLI 和 Web 退出时会关闭 MCP Server；Web 的多个 Session 共享连接，不会为每个 Session 重复启动进程。
 
 ### 工作区指令
 
@@ -367,6 +413,7 @@ pnpm run build
 - Git 分支/文件状态、暂存/未暂存差异、UTF-8 截断和仓库边界
 - HTTP/HTTPS 文本获取、逐跳重定向校验、SSRF 地址阻断、字符集和大小限制
 - OpenAI Responses API 原生 Web Search 工具注入与本地函数工具隔离
+- stdio MCP 配置解析、动态工具发现、双 Provider 定义适配、调用错误和连接关闭
 - Shell 命令的工作目录、退出码、超时、输出截断和敏感环境变量清理
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic/OpenAI 会话历史统一展示与内部数据过滤

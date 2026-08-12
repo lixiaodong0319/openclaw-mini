@@ -25,6 +25,7 @@ function createLoop(
     toolExecutor?: ToolExecutor;
     compaction?: Partial<ContextCompactionOptions>;
     onHistoryReplace?: (messages: Anthropic.MessageParam[]) => Promise<void>;
+    additionalTools?: Anthropic.Tool[];
   } = {},
 ): AgentLoop {
   return new AgentLoop({
@@ -35,6 +36,7 @@ function createLoop(
       onMessage: options.onMessage,
       onHistoryReplace: options.onHistoryReplace,
       compaction: options.compaction,
+      additionalTools: options.additionalTools,
     }),
     toolContext: { workspaceRoot },
     maxIterations: options.maxIterations,
@@ -60,6 +62,39 @@ describe("AgentLoop", () => {
 
     await expect(loop.runTurn("hi")).resolves.toEqual({ text: "hello", stopReason: "end_turn" });
     expect(persisted).toHaveLength(2);
+  });
+
+  it("adds dynamically discovered MCP tools and requires confirmation", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_mcp", "mcp__demo__lookup", { query: "x" })], "tool_use"),
+      message([textBlock("done")], "end_turn"),
+    ]);
+    const toolExecutor = vi.fn<ToolExecutor>(async () => "found");
+    const loop = createLoop(provider, [], workspaceRoot, {
+      toolExecutor,
+      additionalTools: [{
+        name: "mcp__demo__lookup",
+        description: "MCP lookup",
+        input_schema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      }],
+    });
+    const confirm = vi.fn(async () => true);
+
+    await loop.runTurn("use MCP", undefined, confirm);
+
+    expect(provider.calls[0]?.tools).toContainEqual(expect.objectContaining({
+      name: "mcp__demo__lookup",
+    }));
+    expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ name: "mcp__demo__lookup" }));
+    expect(toolExecutor).toHaveBeenCalledWith(
+      "mcp__demo__lookup",
+      { query: "x" },
+      expect.objectContaining({ workspaceRoot }),
+    );
   });
 
   it("forwards streamed text deltas", async () => {

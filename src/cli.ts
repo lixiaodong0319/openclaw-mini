@@ -34,6 +34,7 @@ async function main(): Promise<void> {
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);
   console.log(`Instructions: ${describeWorkspaceInstructions(runtime.workspaceInstructions)}`);
+  console.log(`MCP: ${runtime.mcp.serverCount} server(s), ${runtime.mcp.toolCount} tool(s)`);
   console.log("输入 /help 查看命令，输入 /exit 退出。\n");
 
   // 使用 readline/promises 实现最小 REPL。
@@ -92,6 +93,7 @@ async function main(): Promise<void> {
   } finally {
     // 无论用户 /exit 还是循环中发生未捕获错误，都释放 stdin 和进程事件监听。
     rl.close();
+    await runtime.mcp.close();
   }
 }
 

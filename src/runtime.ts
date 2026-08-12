@@ -1,7 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { AgentLoop } from "./agent-loop.js";
+import { AgentLoop, type ToolExecutor } from "./agent-loop.js";
+import { executeTool, type ToolContext } from "./tools.js";
 import {
   DEFAULT_CONTEXT_COMPACTION_OPTIONS,
   resolveContextCompactionOptions,
@@ -18,6 +19,7 @@ import {
   type OpenAIInputItem,
 } from "./provider.js";
 import { migrateLegacyAnthropicSessions, SessionStore } from "./session-store.js";
+import { McpManager } from "./mcp.js";
 import {
   buildSystemPrompt,
   loadWorkspaceInstructions,
@@ -38,10 +40,12 @@ export interface AgentRuntime extends RuntimeConfig {
   sessionId: string;
   agent: AgentLoop;
   workspaceInstructions?: WorkspaceInstructions;
+  mcp: McpManager;
 }
 
 export interface RuntimePreparation {
   workspaceInstructions?: WorkspaceInstructions;
+  mcp: McpManager;
 }
 
 // CLI 和 Web 都从这里解析路径与模型，避免两个入口逐渐出现不同默认值。
@@ -61,20 +65,31 @@ export async function createAgentRuntime(
   config = resolveRuntimeConfig(),
   preparation?: RuntimePreparation,
 ): Promise<AgentRuntime> {
+  const ownsPreparation = preparation === undefined;
   const prepared = preparation ?? await prepareRuntime(config);
-  const agent = await createAgent(
-    config.providerName,
-    config.dataRoot,
-    sessionId,
-    config.workspaceRoot,
-    config.model,
-    prepared.workspaceInstructions,
-  );
+  let agent: AgentLoop;
+  try {
+    agent = await createAgent(
+      config.providerName,
+      config.dataRoot,
+      sessionId,
+      config.workspaceRoot,
+      config.model,
+      prepared.workspaceInstructions,
+      prepared.mcp,
+    );
+  } catch (error) {
+    // CLI 自己创建的 MCP 连接在后续初始化失败时必须释放。
+    // Web 传入共享 preparation，因此由 Web Server 的生命周期统一关闭。
+    if (ownsPreparation) await prepared.mcp.close();
+    throw error;
+  }
   return {
     ...config,
     sessionId,
     agent,
     workspaceInstructions: prepared.workspaceInstructions,
+    mcp: prepared.mcp,
   };
 }
 
@@ -86,6 +101,7 @@ export async function prepareRuntime(config: RuntimeConfig): Promise<RuntimePrep
   }
   return {
     workspaceInstructions: await loadWorkspaceInstructions(config.workspaceRoot),
+    mcp: await McpManager.load(config.projectRoot),
   };
 }
 
@@ -96,12 +112,18 @@ async function createAgent(
   workspaceRoot: string,
   model: string,
   workspaceInstructions?: WorkspaceInstructions,
+  mcp?: McpManager,
 ): Promise<AgentLoop> {
   const compaction = getContextCompactionOptions();
   const systemPrompt = buildSystemPrompt(workspaceInstructions);
-  const toolContext = {
+  const mcpDefinitions = mcp?.getDefinitions();
+  const toolContext: ToolContext = {
     workspaceRoot,
     commandTimeoutMs: getCommandTimeoutMs(),
+  };
+  const toolExecutor: ToolExecutor = async (name, input, context) => {
+    if (mcp?.hasTool(name)) return mcp.execute(name, input);
+    return executeTool(name, input, context);
   };
 
   if (providerName === "openai") {
@@ -115,8 +137,10 @@ async function createAgent(
         onItem: (item) => store.append(item),
         onHistoryReplace: (items) => store.replace(items),
         compaction,
+        additionalTools: mcpDefinitions?.openai,
       }),
       toolContext,
+      toolExecutor,
       systemPrompt,
     });
   }
@@ -130,8 +154,10 @@ async function createAgent(
       onMessage: (message) => store.append(message),
       onHistoryReplace: (replacement) => store.replace(replacement),
       compaction,
+      additionalTools: mcpDefinitions?.anthropic,
     }),
     toolContext,
+    toolExecutor,
     systemPrompt,
   });
 }

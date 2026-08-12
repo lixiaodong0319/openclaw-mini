@@ -38,23 +38,48 @@ async function main(): Promise<void> {
     ),
     loadHistory: (sessionId) => loadSessionHistory(config, sessionId),
   });
+  server.once("close", () => {
+    void preparation.mcp.close();
+  });
   const port = readPositiveIntegerEnvironment("OPENCLAW_WEB_PORT", 3000);
   if (port > 65_535) throw new Error("OPENCLAW_WEB_PORT must not exceed 65535");
   const host = process.env.OPENCLAW_WEB_HOST || "127.0.0.1";
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, host, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    await preparation.mcp.close();
+    throw error;
+  }
+
+  let shuttingDown = false;
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await preparation.mcp.close();
+  };
+  const handleSignal = (): void => {
+    void shutdown().catch((error) => {
+      console.error(formatRuntimeError(error));
+      process.exitCode = 1;
+    });
+  };
+  process.once("SIGINT", handleSignal);
+  process.once("SIGTERM", handleSignal);
 
   console.log(`OpenClaw Mini Web: http://${host}:${port}`);
   console.log(`Provider: ${config.providerName}`);
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);
   console.log(`Instructions: ${describeWorkspaceInstructions(preparation.workspaceInstructions)}`);
+  console.log(`MCP: ${preparation.mcp.serverCount} server(s), ${preparation.mcp.toolCount} tool(s)`);
   console.log("按 Ctrl+C 退出。");
 }
 
