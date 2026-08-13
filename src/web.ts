@@ -6,7 +6,12 @@ import {
   readPositiveIntegerEnvironment,
   resolveRuntimeConfig,
 } from "./runtime.js";
-import { listSessionIds } from "./session-store.js";
+import {
+  createSession,
+  deleteSession,
+  listSessionIds,
+  renameSession,
+} from "./session-store.js";
 import { loadSessionHistory } from "./session-history.js";
 import { createWebServer } from "./web-server.js";
 import { describeWorkspaceInstructions } from "./workspace-instructions.js";
@@ -36,6 +41,25 @@ async function main(): Promise<void> {
       config.dataRoot,
       config.providerName,
     ),
+    createSession: (sessionId) => createSession(
+      config.dataRoot,
+      sessionId,
+      config.providerName,
+    ),
+    renameSession: (oldSessionId, newSessionId) => renameSession(
+      config.dataRoot,
+      oldSessionId,
+      newSessionId,
+      config.providerName,
+    ),
+    deleteSession: (sessionId) => deleteSession(
+      config.dataRoot,
+      sessionId,
+      config.providerName,
+    ),
+    releaseAgent: (sessionId) => {
+      agents.delete(sessionId);
+    },
     loadHistory: (sessionId) => loadSessionHistory(config, sessionId),
   });
   server.once("close", () => {

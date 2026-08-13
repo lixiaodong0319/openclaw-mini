@@ -2,15 +2,32 @@ import type { HistoryEntry, SessionHistoryView } from "./session-history.js";
 import type { McpStatusView } from "./mcp.js";
 
 export const CLI_HELP_TEXT = `内置命令:
-  /help     查看命令帮助
-  /status   查看当前运行配置
-  /history  查看当前 Session 的安全历史视图
-  /mcp      查看已连接的 MCP Server 和工具
-  /compact  手动压缩早期会话历史
-  /clear    清空当前 Session 历史（需要确认）
-  /exit     退出`;
+  /help             查看命令帮助
+  /status           查看当前运行配置
+  /sessions         列出当前 Provider 的 Session
+  /new <id>         新建并切换 Session
+  /switch <id>      切换到已有 Session
+  /rename <new-id>  重命名当前 Session
+  /delete <id>      删除 Session（需要确认）
+  /history          查看当前 Session 的安全历史视图
+  /mcp              查看已连接的 MCP Server 和工具
+  /compact          手动压缩早期会话历史
+  /clear            清空当前 Session 历史（需要确认）
+  /exit             退出`;
 
-export type CliCommandName = "help" | "status" | "history" | "mcp" | "compact" | "clear" | "exit";
+export type CliCommandName =
+  | "help"
+  | "status"
+  | "sessions"
+  | "new"
+  | "switch"
+  | "rename"
+  | "delete"
+  | "history"
+  | "mcp"
+  | "compact"
+  | "clear"
+  | "exit";
 
 export interface ParsedCliCommand {
   name: string;
@@ -20,6 +37,11 @@ export interface ParsedCliCommand {
 const CLI_COMMAND_NAMES = new Set<CliCommandName>([
   "help",
   "status",
+  "sessions",
+  "new",
+  "switch",
+  "rename",
+  "delete",
   "history",
   "mcp",
   "compact",
@@ -54,6 +76,15 @@ export function formatSessionHistory(history: SessionHistoryView): string {
     blocks.unshift("[提示] 历史较长，仅展示安全视图中的最近 200 项");
   }
   return blocks.join("\n\n");
+}
+
+export function formatSessionList(sessionIds: string[], currentSessionId: string): string {
+  const uniqueIds = [...new Set([...sessionIds, currentSessionId])]
+    .sort((left, right) => left.localeCompare(right));
+  const lines = uniqueIds.map((sessionId) => (
+    `${sessionId === currentSessionId ? "*" : " "} ${sessionId}`
+  ));
+  return `[Session] ${uniqueIds.length} session(s)\n${lines.join("\n")}`;
 }
 
 export function formatMcpStatus(status: McpStatusView): string {

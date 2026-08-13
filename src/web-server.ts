@@ -18,6 +18,10 @@ export interface WebServerOptions {
   workspaceInstructions?: WorkspaceInstructions;
   getAgent: (sessionId: string) => Promise<AgentRunner>;
   listSessions: () => Promise<string[]>;
+  createSession: (sessionId: string) => Promise<void>;
+  renameSession: (oldSessionId: string, newSessionId: string) => Promise<void>;
+  deleteSession: (sessionId: string) => Promise<void>;
+  releaseAgent: (sessionId: string) => void;
   loadHistory: (sessionId: string) => Promise<SessionHistoryView>;
   confirmationTimeoutMs?: number;
   page?: string;
@@ -95,6 +99,39 @@ async function routeRequest(
 
   if (request.method === "GET" && url.pathname === "/api/sessions") {
     writeJson(response, 200, { sessions: await options.listSessions() });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/sessions") {
+    const body = await readJsonObject(request);
+    const sessionId = requireSessionId(body.sessionId);
+    await options.createSession(sessionId);
+    writeJson(response, 201, { sessionId });
+    return;
+  }
+
+  const sessionMutationMatch = /^\/api\/sessions\/([^/]+)$/.exec(url.pathname);
+  if (sessionMutationMatch && (request.method === "PATCH" || request.method === "DELETE")) {
+    const sessionId = requireSessionId(decodePathSegment(sessionMutationMatch[1] ?? ""));
+    if (busySessions.has(sessionId)) {
+      throw new HttpError(409, `session ${sessionId} already has a running turn`);
+    }
+    if (request.method === "PATCH") {
+      const body = await readJsonObject(request);
+      const newSessionId = requireSessionId(body.newSessionId);
+      if (busySessions.has(newSessionId)) {
+        throw new HttpError(409, `session ${newSessionId} already has a running turn`);
+      }
+      await options.renameSession(sessionId, newSessionId);
+      options.releaseAgent(sessionId);
+      options.releaseAgent(newSessionId);
+      writeJson(response, 200, { sessionId: newSessionId });
+      return;
+    }
+    await options.deleteSession(sessionId);
+    options.releaseAgent(sessionId);
+    response.writeHead(204, { "Cache-Control": "no-store" });
+    response.end();
     return;
   }
 

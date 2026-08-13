@@ -1,13 +1,13 @@
 import { createInterface, type Interface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
-  type AgentLoop,
   type AgentEvent,
   type ToolConfirmationRequest,
 } from "./agent-loop.js";
 import {
   CLI_HELP_TEXT,
   formatMcpStatus,
+  formatSessionList,
   formatSessionHistory,
   isCliCommandName,
   parseCliCommand,
@@ -17,21 +17,27 @@ import {
   createAgentRuntime,
   formatRuntimeError,
   resolveRuntimeConfig,
+  type AgentRuntime,
   type RuntimeConfig,
 } from "./runtime.js";
+import {
+  createSession,
+  deleteSession,
+  listSessionIds,
+  renameSession,
+  sessionExists,
+} from "./session-store.js";
 import { loadSessionHistory } from "./session-history.js";
 import { describeWorkspaceInstructions } from "./workspace-instructions.js";
-import type { McpManager } from "./mcp.js";
 
 async function main(): Promise<void> {
   // CLI 参数目前只解析 --session，保持入口足够小。
   // 更多配置先用环境变量承载，例如 OPENCLAW_MODEL。
-  const sessionId = parseSessionId(process.argv.slice(2));
+  const initialSessionId = parseSessionId(process.argv.slice(2));
   const config = resolveRuntimeConfig();
-  const runtime = await createAgentRuntime(sessionId, config);
-  const { agent } = runtime;
+  let runtime = await createAgentRuntime(initialSessionId, config);
 
-  console.log(`OpenClaw Mini session: ${sessionId}`);
+  console.log(`OpenClaw Mini session: ${runtime.sessionId}`);
   console.log(`Provider: ${config.providerName}`);
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);
@@ -56,21 +62,22 @@ async function main(): Promise<void> {
           output.write(`[命令] 未知命令 /${command.name || ""}，输入 /help 查看帮助。\n\n`);
           continue;
         }
-        if (command.argument.length > 0) {
-          output.write(`[命令] /${command.name} 不接受参数。\n\n`);
-          continue;
+        if (command.name === "exit") {
+          if (command.argument.length > 0) {
+            output.write("[命令] /exit 不接受参数。\n\n");
+            continue;
+          }
+          break;
         }
-        if (command.name === "exit") break;
 
         try {
-          await executeCliCommand(command.name, {
-            agent,
+          const replacement = await executeCliCommand(command.name, command.argument, {
+            runtime,
             config,
-            sessionId,
             instructions: describeWorkspaceInstructions(runtime.workspaceInstructions),
-            mcp: runtime.mcp,
             rl,
           });
+          if (replacement) runtime = replacement;
         } catch (error) {
           // 命令失败和普通轮次失败一样不退出 REPL，避免一次摘要或磁盘错误终止会话。
           console.error(formatRuntimeError(error));
@@ -81,7 +88,7 @@ async function main(): Promise<void> {
 
       const renderer = createTurnRenderer();
       try {
-        await agent.runTurn(
+        await runtime.agent.runTurn(
           line,
           renderer.handle,
           (request) => confirmToolCall(rl, request),
@@ -101,67 +108,162 @@ async function main(): Promise<void> {
 }
 
 interface CliCommandContext {
-  agent: AgentLoop;
+  runtime: AgentRuntime;
   config: RuntimeConfig;
-  sessionId: string;
   instructions: string;
-  mcp: McpManager;
   rl: Interface;
 }
 
 async function executeCliCommand(
   command: Exclude<CliCommandName, "exit">,
+  argument: string,
   context: CliCommandContext,
-): Promise<void> {
+): Promise<AgentRuntime | undefined> {
+  const requiresArgument = command === "new"
+    || command === "switch"
+    || command === "rename"
+    || command === "delete";
+  if (requiresArgument && argument.length === 0) {
+    output.write(`[命令] /${command} 需要 Session 名称。\n\n`);
+    return undefined;
+  }
+  if (!requiresArgument && argument.length > 0) {
+    output.write(`[命令] /${command} 不接受参数。\n\n`);
+    return undefined;
+  }
+
   if (command === "help") {
     output.write(`${CLI_HELP_TEXT}\n\n`);
-    return;
+    return undefined;
   }
 
   if (command === "status") {
     output.write(`[状态]
-Session: ${context.sessionId}
+Session: ${context.runtime.sessionId}
 Provider: ${context.config.providerName}
 Model: ${context.config.model}
 Workspace: ${context.config.workspaceRoot}
 Instructions: ${context.instructions}\n\n`);
-    return;
+    return undefined;
+  }
+
+  if (command === "sessions") {
+    const sessions = await listSessionIds(context.config.dataRoot, context.config.providerName);
+    output.write(`${formatSessionList(sessions, context.runtime.sessionId)}\n\n`);
+    return undefined;
+  }
+
+  if (command === "new") {
+    await createSession(context.config.dataRoot, argument, context.config.providerName);
+    const replacement = await createSharedAgentRuntime(argument, context);
+    output.write(`[会话] 已新建并切换到 Session ${argument}。\n\n`);
+    return replacement;
+  }
+
+  if (command === "switch") {
+    if (argument === context.runtime.sessionId) {
+      output.write(`[会话] 当前已是 Session ${argument}。\n\n`);
+      return undefined;
+    }
+    if (!await sessionExists(context.config.dataRoot, argument, context.config.providerName)) {
+      throw new Error(`session not found: ${argument}`);
+    }
+    const replacement = await createSharedAgentRuntime(argument, context);
+    output.write(`[会话] 已切换到 Session ${argument}。\n\n`);
+    return replacement;
+  }
+
+  if (command === "rename") {
+    const oldSessionId = context.runtime.sessionId;
+    if (argument === oldSessionId) {
+      output.write(`[会话] Session 名称未变。\n\n`);
+      return undefined;
+    }
+    if (await sessionExists(context.config.dataRoot, oldSessionId, context.config.providerName)) {
+      await renameSession(
+        context.config.dataRoot,
+        oldSessionId,
+        argument,
+        context.config.providerName,
+      );
+    } else {
+      // 启动后还没有消息的默认会话尚无文件，重命名时直接创建新空会话。
+      await createSession(context.config.dataRoot, argument, context.config.providerName);
+    }
+    const replacement = await createSharedAgentRuntime(argument, context);
+    output.write(`[会话] Session ${oldSessionId} 已重命名为 ${argument}。\n\n`);
+    return replacement;
+  }
+
+  if (command === "delete") {
+    const answer = (await context.rl.question(
+      `确认删除 Session ${argument} 的全部历史？[y/N] `,
+    )).trim().toLowerCase();
+    if (answer !== "y" && answer !== "yes") {
+      output.write("[会话] 已取消删除。\n\n");
+      return undefined;
+    }
+    await deleteSession(context.config.dataRoot, argument, context.config.providerName);
+    if (argument !== context.runtime.sessionId) {
+      output.write(`[会话] Session ${argument} 已删除。\n\n`);
+      return undefined;
+    }
+
+    const remaining = await listSessionIds(context.config.dataRoot, context.config.providerName);
+    const nextSessionId = remaining[0] ?? "default";
+    if (remaining.length === 0) {
+      await createSession(context.config.dataRoot, nextSessionId, context.config.providerName);
+    }
+    const replacement = await createSharedAgentRuntime(nextSessionId, context);
+    output.write(`[会话] Session ${argument} 已删除，已切换到 ${nextSessionId}。\n\n`);
+    return replacement;
   }
 
   if (command === "history") {
-    const history = await loadSessionHistory(context.config, context.sessionId);
+    const history = await loadSessionHistory(context.config, context.runtime.sessionId);
     output.write(`${formatSessionHistory(history)}\n\n`);
-    return;
+    return undefined;
   }
 
   if (command === "mcp") {
-    output.write(`${formatMcpStatus(context.mcp.getStatus())}\n\n`);
-    return;
+    output.write(`${formatMcpStatus(context.runtime.mcp.getStatus())}\n\n`);
+    return undefined;
   }
 
   if (command === "compact") {
     const renderer = createTurnRenderer();
     try {
-      const result = await context.agent.compactContext(renderer.handle);
+      const result = await context.runtime.agent.compactContext(renderer.handle);
       if (!result) {
         output.write("[会话] 没有可压缩的早期历史；需超过保留轮次数。\n");
       }
     } finally {
       renderer.finish();
     }
-    return;
+    return undefined;
   }
 
   // /clear 是不可恢复操作，仍沿用工具确认的安全默认值：仅 y/yes 继续。
   const answer = (await context.rl.question(
-    `确认清空 Session ${context.sessionId} 的全部历史？[y/N] `,
+    `确认清空 Session ${context.runtime.sessionId} 的全部历史？[y/N] `,
   )).trim().toLowerCase();
   if (answer !== "y" && answer !== "yes") {
     output.write("[会话] 已取消清空。\n\n");
-    return;
+    return undefined;
   }
-  await context.agent.clearHistory();
-  output.write(`[会话] Session ${context.sessionId} 的历史已清空。\n\n`);
+  await context.runtime.agent.clearHistory();
+  output.write(`[会话] Session ${context.runtime.sessionId} 的历史已清空。\n\n`);
+  return undefined;
+}
+
+function createSharedAgentRuntime(
+  sessionId: string,
+  context: CliCommandContext,
+): Promise<AgentRuntime> {
+  return createAgentRuntime(sessionId, context.config, {
+    workspaceInstructions: context.runtime.workspaceInstructions,
+    mcp: context.runtime.mcp,
+  });
 }
 
 function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: () => void } {

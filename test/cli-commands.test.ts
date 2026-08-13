@@ -1,6 +1,7 @@
 import {
   CLI_HELP_TEXT,
   formatMcpStatus,
+  formatSessionList,
   formatSessionHistory,
   isCliCommandName,
   parseCliCommand,
@@ -15,11 +16,31 @@ describe("CLI commands", () => {
   });
 
   it("recognizes every documented command", () => {
-    for (const name of ["help", "status", "history", "mcp", "compact", "clear", "exit"]) {
+    for (const name of [
+      "help",
+      "status",
+      "sessions",
+      "new",
+      "switch",
+      "rename",
+      "delete",
+      "history",
+      "mcp",
+      "compact",
+      "clear",
+      "exit",
+    ]) {
       expect(isCliCommandName(name)).toBe(true);
       expect(CLI_HELP_TEXT).toContain(`/${name}`);
     }
     expect(isCliCommandName("unknown")).toBe(false);
+  });
+
+  it("formats the session list and marks the current session", () => {
+    expect(formatSessionList(["work", "default"], "work")).toBe(
+      "[Session] 2 session(s)\n  default\n* work",
+    );
+    expect(formatSessionList([], "default")).toContain("* default");
   });
 
   it("formats MCP servers and tools for terminal display", () => {

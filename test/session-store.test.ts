@@ -3,8 +3,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  createSession,
+  deleteSession,
   listSessionIds,
   migrateLegacyAnthropicSessions,
+  renameSession,
+  sessionExists,
   SessionStore,
 } from "../src/session-store.js";
 
@@ -70,6 +74,37 @@ describe("SessionStore", () => {
     await expect(listSessionIds(root, "anthropic")).resolves.toEqual(["z-last"]);
     await expect(listSessionIds(root, "openai")).resolves.toEqual(["a_first"]);
     await expect(listSessionIds(root, "missing")).resolves.toEqual([]);
+  });
+
+  it("creates, detects, renames, and deletes an empty session", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-store-"));
+
+    await createSession(root, "first", "openai");
+    await expect(sessionExists(root, "first", "openai")).resolves.toBe(true);
+    await expect(listSessionIds(root, "openai")).resolves.toEqual(["first"]);
+    await expect(createSession(root, "first", "openai")).rejects.toThrow("already exists");
+
+    await renameSession(root, "first", "renamed", "openai");
+    await expect(sessionExists(root, "first", "openai")).resolves.toBe(false);
+    await expect(sessionExists(root, "renamed", "openai")).resolves.toBe(true);
+    await expect(listSessionIds(root, "openai")).resolves.toEqual(["renamed"]);
+
+    await deleteSession(root, "renamed", "openai");
+    await expect(listSessionIds(root, "openai")).resolves.toEqual([]);
+    await expect(deleteSession(root, "renamed", "openai")).rejects.toThrow("not found");
+  });
+
+  it("renames history without overwriting an existing session", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-store-"));
+    const source = new SessionStore<string>(root, "source", "anthropic");
+    const target = new SessionStore<string>(root, "target", "anthropic");
+    await source.append("source history");
+    await target.append("target history");
+
+    await expect(renameSession(root, "source", "target", "anthropic"))
+      .rejects.toThrow("already exists");
+    await expect(source.load()).resolves.toEqual(["source history"]);
+    await expect(target.load()).resolves.toEqual(["target history"]);
   });
 
   it("migrates legacy Anthropic sessions without overwriting namespaced history", async () => {

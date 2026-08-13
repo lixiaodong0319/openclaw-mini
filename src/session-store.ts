@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { Dirent } from "node:fs";
+import { constants as fsConstants, type Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -12,12 +12,8 @@ export class SessionStore<T = Anthropic.MessageParam> {
   constructor(dataRoot: string, sessionId: string, namespace?: string) {
     // sessionId 会直接参与生成文件名，所以这里把允许字符限制到非常小的集合。
     // 这样可以阻止 ../、斜杠、反斜杠、盘符等路径穿越或跨目录写入问题。
-    if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
-      throw new Error("session id may only contain letters, numbers, underscores, and hyphens");
-    }
-    if (namespace !== undefined && !/^[A-Za-z0-9_-]+$/.test(namespace)) {
-      throw new Error("session namespace may only contain letters, numbers, underscores, and hyphens");
-    }
+    validateSessionId(sessionId);
+    validateSessionNamespace(namespace);
 
     // 所有会话统一放在 data/sessions 下。
     // data/ 已在 .gitignore 中忽略，避免把用户对话内容或工具结果误提交。
@@ -83,12 +79,8 @@ export class SessionStore<T = Anthropic.MessageParam> {
 // Web UI 用它填充 session 下拉框。只返回符合 SessionStore 命名规则的 JSONL 文件，
 // 临时文件、损坏命名和子目录都不会暴露给浏览器。
 export async function listSessionIds(dataRoot: string, namespace?: string): Promise<string[]> {
-  if (namespace !== undefined && !/^[A-Za-z0-9_-]+$/.test(namespace)) {
-    throw new Error("session namespace may only contain letters, numbers, underscores, and hyphens");
-  }
-  const directory = namespace
-    ? path.join(dataRoot, "sessions", namespace)
-    : path.join(dataRoot, "sessions");
+  validateSessionNamespace(namespace);
+  const directory = getSessionDirectory(dataRoot, namespace);
   try {
     const entries = await fs.readdir(directory, { withFileTypes: true });
     return entries
@@ -99,6 +91,79 @@ export async function listSessionIds(dataRoot: string, namespace?: string): Prom
     if (isNodeError(error) && error.code === "ENOENT") return [];
     throw error;
   }
+}
+
+// 显式创建一个空 JSONL，使尚未发生对话的新会话也能立即出现在 CLI/Web 列表中。
+// wx 使用排他创建，同名会话不会被截断或覆盖。
+export async function createSession(
+  dataRoot: string,
+  sessionId: string,
+  namespace?: string,
+): Promise<void> {
+  const filePath = getSessionFilePath(dataRoot, sessionId, namespace);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    const handle = await fs.open(filePath, "wx");
+    await handle.close();
+  } catch (error) {
+    if (isNodeError(error) && error.code === "EEXIST") {
+      throw new Error(`session already exists: ${sessionId}`);
+    }
+    throw error;
+  }
+}
+
+export async function sessionExists(
+  dataRoot: string,
+  sessionId: string,
+  namespace?: string,
+): Promise<boolean> {
+  const filePath = getSessionFilePath(dataRoot, sessionId, namespace);
+  try {
+    const stat = await fs.lstat(filePath);
+    return stat.isFile();
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+// 先以硬链接排他创建新名称，再删除旧名称：目标已存在时绝不覆盖；
+// 两步之间进程退出时最多留下两个指向同一完整内容的名称，不会损坏历史。
+export async function renameSession(
+  dataRoot: string,
+  oldSessionId: string,
+  newSessionId: string,
+  namespace?: string,
+): Promise<void> {
+  const source = getSessionFilePath(dataRoot, oldSessionId, namespace);
+  const target = getSessionFilePath(dataRoot, newSessionId, namespace);
+  await requireRegularSessionFile(source, oldSessionId);
+  try {
+    await fs.link(source, target);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "EEXIST") {
+      throw new Error(`session already exists: ${newSessionId}`);
+    }
+    throw error;
+  }
+  try {
+    await fs.unlink(source);
+  } catch (error) {
+    // 删除旧名称失败时撤销新链接，恢复到调用前状态。
+    await fs.unlink(target).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function deleteSession(
+  dataRoot: string,
+  sessionId: string,
+  namespace?: string,
+): Promise<void> {
+  const filePath = getSessionFilePath(dataRoot, sessionId, namespace);
+  await requireRegularSessionFile(filePath, sessionId);
+  await fs.unlink(filePath);
 }
 
 // 早期版本把 Anthropic 会话直接写在 data/sessions/*.jsonl。
@@ -144,4 +209,42 @@ export async function migrateLegacyAnthropicSessions(dataRoot: string): Promise<
 // 这里用窄化函数避免在 catch 的 unknown 上直接访问 error.code。
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+function validateSessionId(sessionId: string): void {
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
+    throw new Error("session id may only contain letters, numbers, underscores, and hyphens");
+  }
+}
+
+function validateSessionNamespace(namespace?: string): void {
+  if (namespace !== undefined && !/^[A-Za-z0-9_-]+$/.test(namespace)) {
+    throw new Error("session namespace may only contain letters, numbers, underscores, and hyphens");
+  }
+}
+
+function getSessionDirectory(dataRoot: string, namespace?: string): string {
+  validateSessionNamespace(namespace);
+  return namespace
+    ? path.join(dataRoot, "sessions", namespace)
+    : path.join(dataRoot, "sessions");
+}
+
+function getSessionFilePath(dataRoot: string, sessionId: string, namespace?: string): string {
+  validateSessionId(sessionId);
+  return path.join(getSessionDirectory(dataRoot, namespace), `${sessionId}.jsonl`);
+}
+
+async function requireRegularSessionFile(filePath: string, sessionId: string): Promise<void> {
+  try {
+    const stat = await fs.lstat(filePath);
+    if (!stat.isFile()) throw new Error(`session is not a regular file: ${sessionId}`);
+    // access 明确检查当前进程能否读写，避免 rename/delete 到一半才发现权限问题。
+    await fs.access(filePath, fsConstants.R_OK | fsConstants.W_OK);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      throw new Error(`session not found: ${sessionId}`);
+    }
+    throw error;
+  }
 }

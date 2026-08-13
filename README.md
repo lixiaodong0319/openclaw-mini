@@ -377,6 +377,18 @@ data/sessions/openai/default.jsonl
 
 启动 Anthropic CLI 或 Web 服务时，旧版本位于 `data/sessions/*.jsonl` 的合法会话文件会自动迁移到 `data/sessions/anthropic/`。如果新目录已经存在同名文件，旧文件会保留在原位置，不会覆盖新会话。
 
+CLI 运行期可以管理当前 Provider 的会话：
+
+```text
+/sessions         列出会话，`*` 表示当前会话
+/new work         创建并切换到 work
+/switch default   切换到已有会话
+/rename project   把当前会话重命名为 project
+/delete old       确认后删除 old
+```
+
+切换会话只会重新加载对应 JSONL 历史，不会重复启动或连接 MCP Server。重命名不会覆盖同名会话；删除当前会话后会自动切换到剩余会话，没有剩余会话时创建空的 `default`。Web 页面的新建、重命名和删除按钮使用同一套存储规则。
+
 ## 脚本
 
 ```bash

@@ -14,6 +14,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
   <label for="session">Session：</label>
   <select id="session"></select>
   <button id="new-session" type="button">新建 Session</button>
+  <button id="rename-session" type="button">重命名 Session</button>
+  <button id="delete-session" type="button">删除 Session</button>
 
   <hr>
   <main id="messages"></main>
@@ -32,6 +34,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
     const messageElement = document.querySelector("#message");
     const sendElement = document.querySelector("#send");
     const newSessionElement = document.querySelector("#new-session");
+    const renameSessionElement = document.querySelector("#rename-session");
+    const deleteSessionElement = document.querySelector("#delete-session");
     let assistantOutput = null;
     let historyLoadVersion = 0;
 
@@ -105,25 +109,95 @@ export const WEB_PAGE = String.raw`<!doctype html>
         + " | Model: " + config.model
         + " | Workspace: " + config.workspace
         + " | Instructions: " + (config.instructions || "not found");
-      (sessions.sessions.length > 0 ? sessions.sessions : ["default"]).forEach(addSession);
+      if (sessions.sessions.length === 0) {
+        const createResponse = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: "default" }),
+        });
+        if (!createResponse.ok && createResponse.status !== 409) {
+          throw new Error("无法创建默认 Session");
+        }
+        sessions.sessions.push("default");
+      }
+      sessions.sessions.forEach(addSession);
       if ([...sessionElement.options].some((option) => option.value === "default")) {
         sessionElement.value = "default";
       }
       await loadHistory(sessionElement.value);
     }
 
-    newSessionElement.addEventListener("click", () => {
+    async function createNewSession() {
       const sessionId = prompt("输入 Session 名称（字母、数字、下划线或连字符）：");
       if (sessionId === null) return;
       if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
         alert("Session 名称不合法");
         return;
       }
+      const response = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || "无法新建 Session");
+      }
       addSession(sessionId);
       sessionElement.value = sessionId;
-      historyLoadVersion += 1;
-      resetMessages();
-    });
+      await loadHistory(sessionId);
+    }
+
+    async function renameCurrentSession() {
+      const oldSessionId = sessionElement.value;
+      const newSessionId = prompt("输入新 Session 名称：", oldSessionId);
+      if (newSessionId === null || newSessionId === oldSessionId) return;
+      if (!/^[A-Za-z0-9_-]+$/.test(newSessionId)) throw new Error("Session 名称不合法");
+      const response = await fetch("/api/sessions/" + encodeURIComponent(oldSessionId), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ newSessionId }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || "无法重命名 Session");
+      }
+      const option = [...sessionElement.options].find((item) => item.value === oldSessionId);
+      if (option) {
+        option.value = newSessionId;
+        option.textContent = newSessionId;
+      }
+      sessionElement.value = newSessionId;
+      await loadHistory(newSessionId);
+    }
+
+    async function deleteCurrentSession() {
+      const sessionId = sessionElement.value;
+      if (!confirm("确认删除 Session " + sessionId + " 的全部历史？")) return;
+      const response = await fetch("/api/sessions/" + encodeURIComponent(sessionId), {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || "无法删除 Session");
+      }
+      const option = [...sessionElement.options].find((item) => item.value === sessionId);
+      option?.remove();
+      if (sessionElement.options.length === 0) {
+        const createResponse = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: "default" }),
+        });
+        if (!createResponse.ok) throw new Error("无法创建默认 Session");
+        addSession("default");
+      }
+      await loadHistory(sessionElement.value);
+    }
+
+    newSessionElement.addEventListener("click", () => createNewSession().catch(showError));
+    renameSessionElement.addEventListener("click", () => renameCurrentSession().catch(showError));
+    deleteSessionElement.addEventListener("click", () => deleteCurrentSession().catch(showError));
 
     sessionElement.addEventListener("change", () => {
       loadHistory(sessionElement.value).catch(showError);
@@ -228,6 +302,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
       sendElement.disabled = true;
       sessionElement.disabled = true;
       newSessionElement.disabled = true;
+      renameSessionElement.disabled = true;
+      deleteSessionElement.disabled = true;
       try {
         await streamChat(sessionId, message);
       } catch (error) {
@@ -236,6 +312,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
         sendElement.disabled = false;
         sessionElement.disabled = false;
         newSessionElement.disabled = false;
+        renameSessionElement.disabled = false;
+        deleteSessionElement.disabled = false;
         messageElement.focus();
       }
     });

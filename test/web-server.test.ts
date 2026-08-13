@@ -64,6 +64,15 @@ function createRunner(runTurn: AgentLoop["runTurn"]): AgentRunner {
   return { runTurn };
 }
 
+function sessionManagementOptions() {
+  return {
+    createSession: vi.fn(async () => undefined),
+    renameSession: vi.fn(async () => undefined),
+    deleteSession: vi.fn(async () => undefined),
+    releaseAgent: vi.fn(),
+  };
+}
+
 async function listen(server: ReturnType<typeof createWebServer>): Promise<string> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -95,6 +104,7 @@ describe("Web server", () => {
   it("serves the page, runtime config, and session list", async () => {
     const server = createWebServer({
       config,
+      ...sessionManagementOptions(),
       workspaceInstructions: {
         relativePath: "AGENTS.md",
         content: "Use TypeScript.",
@@ -131,6 +141,42 @@ describe("Web server", () => {
       });
   });
 
+  it("creates, renames, and deletes sessions through the API", async () => {
+    const management = sessionManagementOptions();
+    const server = createWebServer({
+      config,
+      ...management,
+      getAgent: async () => createRunner(async () => ({ text: "", stopReason: "done" })),
+      listSessions: async () => [],
+      loadHistory: emptyHistory,
+    });
+    servers.push(server);
+    const baseUrl = await listen(server);
+
+    const created = await fetch(`${baseUrl}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: "demo" }),
+    });
+    expect(created.status).toBe(201);
+    expect(management.createSession).toHaveBeenCalledWith("demo");
+
+    const renamed = await fetch(`${baseUrl}/api/sessions/demo`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ newSessionId: "renamed" }),
+    });
+    expect(renamed.status).toBe(200);
+    expect(management.renameSession).toHaveBeenCalledWith("demo", "renamed");
+    expect(management.releaseAgent).toHaveBeenCalledWith("demo");
+    expect(management.releaseAgent).toHaveBeenCalledWith("renamed");
+
+    const deleted = await fetch(`${baseUrl}/api/sessions/renamed`, { method: "DELETE" });
+    expect(deleted.status).toBe(204);
+    expect(management.deleteSession).toHaveBeenCalledWith("renamed");
+    expect(management.releaseAgent).toHaveBeenCalledWith("renamed");
+  });
+
   it("streams agent text and completion as SSE", async () => {
     const agent = createRunner(async (message, onEvent) => {
       expect(message).toBe("hello");
@@ -140,6 +186,7 @@ describe("Web server", () => {
     });
     const server = createWebServer({
       config,
+      ...sessionManagementOptions(),
       getAgent: async () => agent,
       listSessions: async () => [],
       loadHistory: emptyHistory,
@@ -181,6 +228,7 @@ describe("Web server", () => {
     });
     const server = createWebServer({
       config,
+      ...sessionManagementOptions(),
       getAgent: async () => agent,
       listSessions: async () => [],
       loadHistory: emptyHistory,
@@ -228,6 +276,7 @@ describe("Web server", () => {
   it("rejects cross-origin-friendly content types and unsafe session ids", async () => {
     const server = createWebServer({
       config,
+      ...sessionManagementOptions(),
       getAgent: async () => createRunner(async () => ({ text: "", stopReason: "done" })),
       listSessions: async () => [],
       loadHistory: emptyHistory,
