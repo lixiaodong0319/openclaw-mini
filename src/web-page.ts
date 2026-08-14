@@ -17,6 +17,10 @@ export const WEB_PAGE = String.raw`<!doctype html>
   <button id="rename-session" type="button">重命名 Session</button>
   <button id="delete-session" type="button">删除 Session</button>
 
+  <p>
+    <button id="show-memory" type="button">查看记忆</button>
+  </p>
+
   <hr>
   <main id="messages"></main>
 
@@ -36,6 +40,7 @@ export const WEB_PAGE = String.raw`<!doctype html>
     const newSessionElement = document.querySelector("#new-session");
     const renameSessionElement = document.querySelector("#rename-session");
     const deleteSessionElement = document.querySelector("#delete-session");
+    const showMemoryElement = document.querySelector("#show-memory");
     let assistantOutput = null;
     let historyLoadVersion = 0;
 
@@ -195,9 +200,35 @@ export const WEB_PAGE = String.raw`<!doctype html>
       await loadHistory(sessionElement.value);
     }
 
+    async function fetchMemories() {
+      // 页面不缓存 Markdown 记忆，每次查看都从服务端读取最新副本。
+      const response = await fetch("/api/memory");
+      if (!response.ok) throw new Error("无法读取长期记忆");
+      return (await response.json()).memory;
+    }
+
+    async function showMemories() {
+      const memory = await fetchMemories();
+      const blocks = [];
+      if (!memory.longTerm || memory.longTerm.content.trim().length === 0) {
+        blocks.push("[长期记忆] MEMORY.md 不存在或内容为空");
+      } else {
+        blocks.push("[长期记忆] " + memory.longTerm.relativePath + "\n" + memory.longTerm.content
+          + (memory.longTerm.truncated ? "\n[提示] 当前只展示和注入前 " + memory.longTerm.injectedBytes + " bytes。" : ""));
+      }
+      memory.daily.forEach((daily) => {
+        blocks.push("[每日记忆] " + daily.relativePath + "\n" + daily.content
+          + (daily.truncated ? "\n[提示] 当前只展示和注入 " + daily.injectedBytes + " bytes。" : ""));
+      });
+      if (memory.daily.length === 0) blocks.push("[每日记忆] 今天和昨天暂无记忆文件");
+      const text = blocks.join("\n\n");
+      appendMessage("长期记忆", text);
+    }
+
     newSessionElement.addEventListener("click", () => createNewSession().catch(showError));
     renameSessionElement.addEventListener("click", () => renameCurrentSession().catch(showError));
     deleteSessionElement.addEventListener("click", () => deleteCurrentSession().catch(showError));
+    showMemoryElement.addEventListener("click", () => showMemories().catch(showError));
 
     sessionElement.addEventListener("change", () => {
       loadHistory(sessionElement.value).catch(showError);
@@ -304,6 +335,7 @@ export const WEB_PAGE = String.raw`<!doctype html>
       newSessionElement.disabled = true;
       renameSessionElement.disabled = true;
       deleteSessionElement.disabled = true;
+      showMemoryElement.disabled = true;
       try {
         await streamChat(sessionId, message);
       } catch (error) {
@@ -314,6 +346,7 @@ export const WEB_PAGE = String.raw`<!doctype html>
         newSessionElement.disabled = false;
         renameSessionElement.disabled = false;
         deleteSessionElement.disabled = false;
+        showMemoryElement.disabled = false;
         messageElement.focus();
       }
     });

@@ -605,12 +605,65 @@ describe("tools", () => {
     await expect(executeTool("shell", {}, { workspaceRoot })).rejects.toThrow("Unknown tool");
   });
 
+  it("dispatches read-only memory tools through the runtime memory service", async () => {
+    const memoryIndex = {
+      search: vi.fn(async () => ({
+        query: "TypeScript",
+        results: [],
+        indexedFiles: 1,
+        indexedChunks: 1,
+      })),
+      get: vi.fn(async () => ({
+        path: "MEMORY.md",
+        startLine: 1,
+        endLine: 1,
+        totalLines: 1,
+        content: "TypeScript",
+      })),
+      scheduleSync: vi.fn(),
+    };
+
+    const searchOutput = JSON.parse(await executeTool(
+      "memory_search",
+      { query: "TypeScript", max_results: null },
+      { workspaceRoot, memoryIndex },
+    ));
+    const getOutput = JSON.parse(await executeTool(
+      "memory_get",
+      { path: "MEMORY.md", from_line: null, lines: null },
+      { workspaceRoot, memoryIndex },
+    ));
+
+    expect(searchOutput.indexedFiles).toBe(1);
+    expect(memoryIndex.search).toHaveBeenCalledWith("TypeScript", 10);
+    expect(getOutput.content).toBe("TypeScript");
+    expect(memoryIndex.get).toHaveBeenCalledWith("MEMORY.md", 1, 80);
+  });
+
+  it("schedules a derived memory-index sync after successful file writes", async () => {
+    const memoryIndex = {
+      search: vi.fn(),
+      get: vi.fn(),
+      scheduleSync: vi.fn(),
+    };
+
+    await executeTool(
+      "write_text_file",
+      { path: "MEMORY.md", content: "remember this" },
+      { workspaceRoot, memoryIndex },
+    );
+
+    expect(memoryIndex.scheduleSync).toHaveBeenCalledOnce();
+  });
+
   it("requires confirmation by default except for registered safe tools", () => {
     expect(requiresToolConfirmation("calculator")).toBe(false);
     expect(requiresToolConfirmation("list_directory")).toBe(false);
     expect(requiresToolConfirmation("find_files")).toBe(false);
     expect(requiresToolConfirmation("search_files")).toBe(false);
     expect(requiresToolConfirmation("read_text_file")).toBe(false);
+    expect(requiresToolConfirmation("memory_search")).toBe(false);
+    expect(requiresToolConfirmation("memory_get")).toBe(false);
     expect(requiresToolConfirmation("git_status")).toBe(false);
     expect(requiresToolConfirmation("git_diff")).toBe(false);
     expect(requiresToolConfirmation("create_directory")).toBe(true);

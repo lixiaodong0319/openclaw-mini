@@ -10,6 +10,12 @@ import {
   MAX_GIT_DIFF_BYTES,
 } from "./git-tools.js";
 import { DEFAULT_FETCH_BYTES, fetchUrlText, MAX_FETCH_BYTES } from "./fetch-url.js";
+import {
+  DEFAULT_MEMORY_GET_LINES,
+  MAX_MEMORY_GET_LINES,
+  MAX_MEMORY_SEARCH_RESULTS,
+  type MemoryToolService,
+} from "./memory-index.js";
 
 // 直接复用 SDK 的 Tool 类型，确保工具定义形状和 Anthropic SDK 保持一致。
 // 不额外声明自定义 Tool interface，可以避免 SDK 升级后字段含义或类型漂移。
@@ -30,6 +36,9 @@ export interface ToolContext {
   workspaceRoot: string;
   // 命令超时由宿主配置，不接受模型参数，避免模型自行关闭或无限延长超时。
   commandTimeoutMs?: number;
+  // 记忆索引由 Runtime 创建并注入。直接单测普通文件工具时可以省略；只有两个
+  // memory_* 工具会要求它存在，模型不能通过参数替换 workspace 或数据库位置。
+  memoryIndex?: MemoryToolService;
 }
 
 // read_text_file 的模型输入结构。
@@ -85,6 +94,17 @@ interface SearchFilesInput {
   path: string;
   filePattern?: string;
   maxResults: number;
+}
+
+interface MemorySearchInput {
+  query: string;
+  maxResults: number;
+}
+
+interface MemoryGetInput {
+  path: string;
+  fromLine: number;
+  lines: number;
 }
 
 interface GitStatusInput {
@@ -147,7 +167,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 // 这不是 Shell 沙箱，而是防止 `env` 等普通命令直接暴露 API Key 的额外防线。
 const SENSITIVE_ENVIRONMENT_NAME = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|AUTHORIZATION|COOKIE|SESSION|JWT)(?:_|$)/i;
 
-// 当前七个工具都是只读或纯计算能力，可以直接执行。
+// 当前九个工具都是只读或纯计算能力，可以直接执行。
 // 未登记的新工具默认需要用户确认，避免未来加入写文件、Shell 等能力时意外绕过审批。
 const AUTO_APPROVED_TOOLS = new Set([
   "calculator",
@@ -155,6 +175,8 @@ const AUTO_APPROVED_TOOLS = new Set([
   "find_files",
   "search_files",
   "read_text_file",
+  "memory_search",
+  "memory_get",
   "git_status",
   "git_diff",
 ]);
@@ -276,6 +298,56 @@ export const toolDefinitions: ToolDefinition[] = [
         },
       },
       required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_search",
+    description: "Search long-term MEMORY.md and every memory/*.md file using the local SQLite FTS5/BM25 index. Call this when relevant durable or older daily context may not be present in the current prompt. This tool is read-only.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Words or a short phrase to search for in Markdown memory.",
+        },
+        max_results: {
+          anyOf: [
+            { type: "integer", minimum: 1, maximum: MAX_MEMORY_SEARCH_RESULTS },
+            { type: "null" },
+          ],
+          description: `Maximum matching chunks to return. Use null for the default of 10.`,
+        },
+      },
+      required: ["query", "max_results"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_get",
+    description: "Read an exact line range directly from MEMORY.md or a direct memory/*.md file after memory_search identifies a relevant result. Markdown, not SQLite, is the source of truth. This tool is read-only.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Exact path returned by memory_search: MEMORY.md or memory/<name>.md.",
+        },
+        from_line: {
+          anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }],
+          description: "First 1-based line to read. Use null to start at line 1.",
+        },
+        lines: {
+          anyOf: [
+            { type: "integer", minimum: 1, maximum: MAX_MEMORY_GET_LINES },
+            { type: "null" },
+          ],
+          description: `Number of lines to read. Use null for the default of ${DEFAULT_MEMORY_GET_LINES}.`,
+        },
+      },
+      required: ["path", "from_line", "lines"],
       additionalProperties: false,
     },
   },
@@ -473,6 +545,16 @@ export async function executeTool(
       return searchFiles(parseSearchFilesInput(input), context);
     case "read_text_file":
       return readTextFile(parseReadTextFileInput(input), context);
+    case "memory_search": {
+      const parsed = parseMemorySearchInput(input);
+      const result = await requireMemoryIndex(context).search(parsed.query, parsed.maxResults);
+      return JSON.stringify(result, null, 2);
+    }
+    case "memory_get": {
+      const parsed = parseMemoryGetInput(input);
+      const result = await requireMemoryIndex(context).get(parsed.path, parsed.fromLine, parsed.lines);
+      return JSON.stringify(result, null, 2);
+    }
     case "git_status": {
       const parsed = parseGitStatusInput(input);
       return getGitStatus(context.workspaceRoot, parsed.path);
@@ -488,13 +570,21 @@ export async function executeTool(
     }
     case "create_directory":
       return createDirectory(parseCreateDirectoryInput(input), context);
-    case "write_text_file":
-      return writeTextFile(parseWriteTextFileInput(input), context);
-    case "edit_text_file":
-      return editTextFile(parseEditTextFileInput(input), context);
+    case "write_text_file": {
+      const result = await writeTextFile(parseWriteTextFileInput(input), context);
+      context.memoryIndex?.scheduleSync();
+      return result;
+    }
+    case "edit_text_file": {
+      const result = await editTextFile(parseEditTextFileInput(input), context);
+      context.memoryIndex?.scheduleSync();
+      return result;
+    }
     case "apply_patch": {
       const parsed = parseApplyPatchInput(input);
-      return applyWorkspacePatch(parsed.patch, context.workspaceRoot);
+      const result = await applyWorkspacePatch(parsed.patch, context.workspaceRoot);
+      context.memoryIndex?.scheduleSync();
+      return result;
     }
     case "fetch_url": {
       const parsed = parseFetchUrlInput(input);
@@ -584,6 +674,56 @@ function parseReadTextFileInput(input: unknown): ReadTextFileInput {
   }
 
   return { path: input.path };
+}
+
+function parseMemorySearchInput(input: unknown): MemorySearchInput {
+  if (!isRecord(input) || typeof input.query !== "string") {
+    throw new Error("memory_search requires a string query");
+  }
+  const maxResults = input.max_results;
+  if (
+    maxResults !== undefined && maxResults !== null
+    && (typeof maxResults !== "number" || !Number.isInteger(maxResults)
+      || maxResults < 1 || maxResults > MAX_MEMORY_SEARCH_RESULTS)
+  ) {
+    throw new Error(
+      `memory_search max_results must be an integer between 1 and ${MAX_MEMORY_SEARCH_RESULTS}`,
+    );
+  }
+  return { query: input.query, maxResults: maxResults ?? 10 };
+}
+
+function parseMemoryGetInput(input: unknown): MemoryGetInput {
+  if (!isRecord(input) || typeof input.path !== "string") {
+    throw new Error("memory_get requires a string path");
+  }
+  const fromLine = input.from_line;
+  if (
+    fromLine !== undefined && fromLine !== null
+    && (typeof fromLine !== "number" || !Number.isInteger(fromLine) || fromLine < 1)
+  ) {
+    throw new Error("memory_get from_line must be a positive integer or null");
+  }
+  const lines = input.lines;
+  if (
+    lines !== undefined && lines !== null
+    && (typeof lines !== "number" || !Number.isInteger(lines)
+      || lines < 1 || lines > MAX_MEMORY_GET_LINES)
+  ) {
+    throw new Error(`memory_get lines must be an integer between 1 and ${MAX_MEMORY_GET_LINES}`);
+  }
+  return {
+    path: input.path,
+    fromLine: fromLine ?? 1,
+    lines: lines ?? DEFAULT_MEMORY_GET_LINES,
+  };
+}
+
+function requireMemoryIndex(context: ToolContext): MemoryToolService {
+  if (!context.memoryIndex) {
+    throw new Error("memory index is not configured");
+  }
+  return context.memoryIndex;
 }
 
 function parseGitStatusInput(input: unknown): GitStatusInput {

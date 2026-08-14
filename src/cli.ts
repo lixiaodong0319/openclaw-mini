@@ -29,6 +29,11 @@ import {
 } from "./session-store.js";
 import { loadSessionHistory } from "./session-history.js";
 import { describeWorkspaceInstructions } from "./workspace-instructions.js";
+import {
+  describeDailyMemories,
+  describeWorkspaceMemory,
+  loadWorkspaceMemoryContext,
+} from "./workspace-memory.js";
 
 async function main(): Promise<void> {
   // CLI 参数目前只解析 --session，保持入口足够小。
@@ -42,6 +47,8 @@ async function main(): Promise<void> {
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);
   console.log(`Instructions: ${describeWorkspaceInstructions(runtime.workspaceInstructions)}`);
+  console.log(`Memory: ${describeWorkspaceMemory(runtime.workspaceMemory.longTerm)}`);
+  console.log(`Daily memory: ${describeDailyMemories(runtime.workspaceMemory)}`);
   console.log(`MCP: ${runtime.mcp.serverCount} server(s), ${runtime.mcp.toolCount} tool(s)`);
   console.log("输入 /help 查看命令，输入 /exit 退出。\n");
 
@@ -103,6 +110,7 @@ async function main(): Promise<void> {
   } finally {
     // 无论用户 /exit 还是循环中发生未捕获错误，都释放 stdin 和进程事件监听。
     rl.close();
+    runtime.memoryIndex.close();
     await runtime.mcp.close();
   }
 }
@@ -138,12 +146,15 @@ async function executeCliCommand(
   }
 
   if (command === "status") {
+    const memory = await loadWorkspaceMemoryContext(context.config.workspaceRoot);
     output.write(`[状态]
 Session: ${context.runtime.sessionId}
 Provider: ${context.config.providerName}
 Model: ${context.config.model}
 Workspace: ${context.config.workspaceRoot}
-Instructions: ${context.instructions}\n\n`);
+Instructions: ${context.instructions}
+Memory: ${describeWorkspaceMemory(memory.longTerm)}
+Daily memory: ${describeDailyMemories(memory)}\n\n`);
     return undefined;
   }
 
@@ -230,6 +241,35 @@ Instructions: ${context.instructions}\n\n`);
     return undefined;
   }
 
+  if (command === "memory") {
+    const contextMemory = await loadWorkspaceMemoryContext(context.config.workspaceRoot);
+    const blocks: string[] = [];
+    const longTerm = contextMemory.longTerm;
+    if (longTerm && longTerm.content.trim().length > 0) {
+      const notice = longTerm.truncated
+        ? `\n[提示] 文件共 ${longTerm.bytes} bytes，当前只注入和展示前 ${longTerm.injectedBytes} bytes。`
+        : "";
+      blocks.push(`[长期记忆] ${longTerm.relativePath}\n${longTerm.content}${notice}`);
+    } else {
+      blocks.push("[长期记忆] MEMORY.md 不存在或内容为空。");
+    }
+    if (contextMemory.daily.length === 0) {
+      blocks.push(`[每日记忆] ${contextMemory.yesterday} 和 ${contextMemory.today} 暂无记忆文件。`);
+    } else {
+      for (const daily of contextMemory.daily) {
+        const notice = daily.truncated
+          ? `\n[提示] 文件共 ${daily.bytes} bytes，当前注入和展示 ${daily.injectedBytes} bytes。`
+          : "";
+        blocks.push(`[每日记忆] ${daily.relativePath}\n${daily.content}${notice}`);
+      }
+      if (contextMemory.discoveredDailyFiles > contextMemory.daily.length) {
+        blocks.push(`[提示] 匹配 ${contextMemory.discoveredDailyFiles} 个每日记忆文件，受文件数/字节预算限制，展示 ${contextMemory.daily.length} 个。`);
+      }
+    }
+    output.write(`${blocks.join("\n\n")}\n\n`);
+    return undefined;
+  }
+
   if (command === "compact") {
     const renderer = createTurnRenderer();
     try {
@@ -260,8 +300,11 @@ function createSharedAgentRuntime(
   sessionId: string,
   context: CliCommandContext,
 ): Promise<AgentRuntime> {
+  // workspaceInstructions 是启动快照，记忆索引和 MCP 由各 Session 共享；MEMORY.md 由 AgentLoop
+  // 在每次模型调用前重新加载，无需从旧 runtime 传入。
   return createAgentRuntime(sessionId, context.config, {
     workspaceInstructions: context.runtime.workspaceInstructions,
+    memoryIndex: context.runtime.memoryIndex,
     mcp: context.runtime.mcp,
   });
 }

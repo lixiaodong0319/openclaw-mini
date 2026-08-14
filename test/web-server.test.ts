@@ -1,6 +1,7 @@
 import type { AddressInfo } from "node:net";
 import type { AgentLoop, ToolConfirmationRequest } from "../src/agent-loop.js";
 import type { RuntimeConfig } from "../src/runtime.js";
+import type { WorkspaceMemoryContext } from "../src/workspace-memory.js";
 import { WEB_PAGE } from "../src/web-page.js";
 import { createWebServer } from "../src/web-server.js";
 
@@ -70,6 +71,14 @@ function sessionManagementOptions() {
     renameSession: vi.fn(async () => undefined),
     deleteSession: vi.fn(async () => undefined),
     releaseAgent: vi.fn(),
+    loadMemory: vi.fn(async (): Promise<WorkspaceMemoryContext> => ({
+      longTerm: undefined,
+      daily: [],
+      today: "2026-08-13",
+      yesterday: "2026-08-12",
+      discoveredDailyFiles: 0,
+      dailyTruncated: false,
+    })),
   };
 }
 
@@ -175,6 +184,52 @@ describe("Web server", () => {
     expect(deleted.status).toBe(204);
     expect(management.deleteSession).toHaveBeenCalledWith("renamed");
     expect(management.releaseAgent).toHaveBeenCalledWith("renamed");
+  });
+
+  it("reads long-term and recent daily memory through the API", async () => {
+    const management = sessionManagementOptions();
+    const existing: WorkspaceMemoryContext = {
+      longTerm: {
+        relativePath: "MEMORY.md",
+        content: "# Memory\n\n- Prefer TypeScript.\n",
+        bytes: 36,
+        injectedBytes: 36,
+        truncated: false,
+      },
+      daily: [{
+        relativePath: "memory/2026-08-13.md",
+        date: "2026-08-13",
+        content: "- Worked on memory.\n",
+        bytes: 20,
+        injectedBytes: 20,
+        truncated: false,
+      }],
+      today: "2026-08-13",
+      yesterday: "2026-08-12",
+      discoveredDailyFiles: 1,
+      dailyTruncated: false,
+    };
+    management.loadMemory.mockResolvedValue(existing);
+    const server = createWebServer({
+      config,
+      ...management,
+      getAgent: async () => createRunner(async () => ({ text: "", stopReason: "done" })),
+      listSessions: async () => [],
+      loadHistory: emptyHistory,
+    });
+    servers.push(server);
+    const baseUrl = await listen(server);
+
+    await expect(fetch(`${baseUrl}/api/memory`).then((response) => response.json()))
+      .resolves.toEqual({ memory: existing });
+    expect(management.loadMemory).toHaveBeenCalledTimes(1);
+
+    const unsupportedWrite = await fetch(`${baseUrl}/api/memory`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Prefer TypeScript" }),
+    });
+    expect(unsupportedWrite.status).toBe(404);
   });
 
   it("streams agent text and completion as SSE", async () => {

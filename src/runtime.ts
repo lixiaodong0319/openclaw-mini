@@ -21,6 +21,14 @@ import {
 import { migrateLegacyAnthropicSessions, SessionStore } from "./session-store.js";
 import { McpManager } from "./mcp.js";
 import {
+  MEMORY_INDEX_RELATIVE_PATH,
+  WorkspaceMemoryIndex,
+} from "./memory-index.js";
+import {
+  loadWorkspaceMemoryContext,
+  type WorkspaceMemoryContext,
+} from "./workspace-memory.js";
+import {
   buildSystemPrompt,
   loadWorkspaceInstructions,
   type WorkspaceInstructions,
@@ -40,11 +48,14 @@ export interface AgentRuntime extends RuntimeConfig {
   sessionId: string;
   agent: AgentLoop;
   workspaceInstructions?: WorkspaceInstructions;
+  workspaceMemory: WorkspaceMemoryContext;
+  memoryIndex: WorkspaceMemoryIndex;
   mcp: McpManager;
 }
 
 export interface RuntimePreparation {
   workspaceInstructions?: WorkspaceInstructions;
+  memoryIndex: WorkspaceMemoryIndex;
   mcp: McpManager;
 }
 
@@ -65,10 +76,16 @@ export async function createAgentRuntime(
   config = resolveRuntimeConfig(),
   preparation?: RuntimePreparation,
 ): Promise<AgentRuntime> {
+  // preparation 包含启动期读取的 AGENTS.md、共享记忆索引和已建立的 MCP 连接。
+  // CLI 切换会话、修改记忆以及 Web 创建多个 Agent 时会复用它。
   const ownsPreparation = preparation === undefined;
   const prepared = preparation ?? await prepareRuntime(config);
+  let workspaceMemory: WorkspaceMemoryContext;
   let agent: AgentLoop;
   try {
+    // 启动时先读一次用于校验和状态展示。AgentLoop 运行时仍会在每次
+    // 模型调用前重读 MEMORY.md，因此手工或工具编辑后不需重建 Agent。
+    workspaceMemory = await loadWorkspaceMemoryContext(config.workspaceRoot);
     agent = await createAgent(
       config.providerName,
       config.dataRoot,
@@ -76,12 +93,16 @@ export async function createAgentRuntime(
       config.workspaceRoot,
       config.model,
       prepared.workspaceInstructions,
+      prepared.memoryIndex,
       prepared.mcp,
     );
   } catch (error) {
     // CLI 自己创建的 MCP 连接在后续初始化失败时必须释放。
     // Web 传入共享 preparation，因此由 Web Server 的生命周期统一关闭。
-    if (ownsPreparation) await prepared.mcp.close();
+    if (ownsPreparation) {
+      prepared.memoryIndex.close();
+      await prepared.mcp.close();
+    }
     throw error;
   }
   return {
@@ -89,6 +110,8 @@ export async function createAgentRuntime(
     sessionId,
     agent,
     workspaceInstructions: prepared.workspaceInstructions,
+    memoryIndex: prepared.memoryIndex,
+    workspaceMemory,
     mcp: prepared.mcp,
   };
 }
@@ -99,10 +122,23 @@ export async function prepareRuntime(config: RuntimeConfig): Promise<RuntimePrep
   if (config.providerName === "anthropic") {
     await migrateLegacyAnthropicSessions(config.dataRoot);
   }
-  return {
-    workspaceInstructions: await loadWorkspaceInstructions(config.workspaceRoot),
-    mcp: await McpManager.load(config.projectRoot),
-  };
+  const memoryIndex = new WorkspaceMemoryIndex(
+    config.workspaceRoot,
+    path.join(config.dataRoot, MEMORY_INDEX_RELATIVE_PATH),
+  );
+  // 启动时创建或校验派生索引，让第一次 memory_search 不承担完整初始化延迟。
+  // search 自身仍会再次同步，因此用户在进程运行期间手工编辑 Markdown 也不会漏检。
+  await memoryIndex.sync();
+  try {
+    return {
+      workspaceInstructions: await loadWorkspaceInstructions(config.workspaceRoot),
+      memoryIndex,
+      mcp: await McpManager.load(config.projectRoot),
+    };
+  } catch (error) {
+    memoryIndex.close();
+    throw error;
+  }
 }
 
 async function createAgent(
@@ -112,14 +148,22 @@ async function createAgent(
   workspaceRoot: string,
   model: string,
   workspaceInstructions?: WorkspaceInstructions,
+  memoryIndex?: WorkspaceMemoryIndex,
   mcp?: McpManager,
 ): Promise<AgentLoop> {
   const compaction = getContextCompactionOptions();
-  const systemPrompt = buildSystemPrompt(workspaceInstructions);
+  // Provider 只负责协议适配；这个 resolver 在每次 generateTurn 前重读 MEMORY.md
+  // 以及今天/昨天的 memory/*.md，
+  // 并与默认提示词、启动时的 workspace 指令快照统一组装。
+  const systemPrompt = async (): Promise<string> => buildSystemPrompt(
+    workspaceInstructions,
+    await loadWorkspaceMemoryContext(workspaceRoot),
+  );
   const mcpDefinitions = mcp?.getDefinitions();
   const toolContext: ToolContext = {
     workspaceRoot,
     commandTimeoutMs: getCommandTimeoutMs(),
+    memoryIndex,
   };
   const toolExecutor: ToolExecutor = async (name, input, context) => {
     if (mcp?.hasTool(name)) return mcp.execute(name, input);

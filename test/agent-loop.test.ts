@@ -23,6 +23,7 @@ function createLoop(
     onMessage?: (message: Anthropic.MessageParam) => Promise<void>;
     maxIterations?: number;
     toolExecutor?: ToolExecutor;
+    systemPrompt?: string | (() => string | Promise<string>);
     compaction?: Partial<ContextCompactionOptions>;
     onHistoryReplace?: (messages: Anthropic.MessageParam[]) => Promise<void>;
     additionalTools?: Anthropic.Tool[];
@@ -41,6 +42,7 @@ function createLoop(
     toolContext: { workspaceRoot },
     maxIterations: options.maxIterations,
     toolExecutor: options.toolExecutor,
+    systemPrompt: options.systemPrompt,
   });
 }
 
@@ -110,6 +112,25 @@ describe("AgentLoop", () => {
     expect(events).toEqual([
       { type: "text_delta", text: "hel" },
       { type: "text_delta", text: "lo" },
+    ]);
+  });
+
+  it("resolves a dynamic system prompt before every model call", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_write", "write_text_file", { path: "MEMORY.md", content: "new" })], "tool_use"),
+      message([textBlock("remembered")], "end_turn"),
+    ]);
+    let version = 0;
+    const loop = createLoop(provider, [], workspaceRoot, {
+      systemPrompt: async () => `memory version ${++version}`,
+      toolExecutor: async () => "written",
+    });
+
+    await loop.runTurn("remember this", undefined, async () => true);
+
+    expect(provider.calls.map((call) => call.system)).toEqual([
+      [{ type: "text", text: "memory version 1" }],
+      [{ type: "text", text: "memory version 2" }],
     ]);
   });
 

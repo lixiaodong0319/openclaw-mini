@@ -15,6 +15,11 @@ import {
 import { loadSessionHistory } from "./session-history.js";
 import { createWebServer } from "./web-server.js";
 import { describeWorkspaceInstructions } from "./workspace-instructions.js";
+import {
+  describeDailyMemories,
+  describeWorkspaceMemory,
+  loadWorkspaceMemoryContext,
+} from "./workspace-memory.js";
 
 async function main(): Promise<void> {
   const config = resolveRuntimeConfig();
@@ -61,8 +66,10 @@ async function main(): Promise<void> {
       agents.delete(sessionId);
     },
     loadHistory: (sessionId) => loadSessionHistory(config, sessionId),
+    loadMemory: () => loadWorkspaceMemoryContext(config.workspaceRoot),
   });
   server.once("close", () => {
+    preparation.memoryIndex.close();
     void preparation.mcp.close();
   });
   const port = readPositiveIntegerEnvironment("OPENCLAW_WEB_PORT", 3000);
@@ -78,6 +85,7 @@ async function main(): Promise<void> {
       });
     });
   } catch (error) {
+    preparation.memoryIndex.close();
     await preparation.mcp.close();
     throw error;
   }
@@ -87,6 +95,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    preparation.memoryIndex.close();
     await preparation.mcp.close();
   };
   const handleSignal = (): void => {
@@ -103,6 +112,9 @@ async function main(): Promise<void> {
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);
   console.log(`Instructions: ${describeWorkspaceInstructions(preparation.workspaceInstructions)}`);
+  const workspaceMemory = await loadWorkspaceMemoryContext(config.workspaceRoot);
+  console.log(`Memory: ${describeWorkspaceMemory(workspaceMemory.longTerm)}`);
+  console.log(`Daily memory: ${describeDailyMemories(workspaceMemory)}`);
   console.log(`MCP: ${preparation.mcp.serverCount} server(s), ${preparation.mcp.toolCount} tool(s)`);
   console.log("按 Ctrl+C 退出。");
 }

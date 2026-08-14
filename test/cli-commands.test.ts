@@ -26,6 +26,7 @@ describe("CLI commands", () => {
       "delete",
       "history",
       "mcp",
+      "memory",
       "compact",
       "clear",
       "exit",

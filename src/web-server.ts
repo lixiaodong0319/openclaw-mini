@@ -9,6 +9,7 @@ import type { RuntimeConfig } from "./runtime.js";
 import { formatRuntimeError } from "./runtime.js";
 import type { SessionHistoryView } from "./session-history.js";
 import type { WorkspaceInstructions } from "./workspace-instructions.js";
+import type { WorkspaceMemoryContext } from "./workspace-memory.js";
 import { WEB_PAGE } from "./web-page.js";
 
 type AgentRunner = Pick<AgentLoop, "runTurn">;
@@ -23,6 +24,8 @@ export interface WebServerOptions {
   deleteSession: (sessionId: string) => Promise<void>;
   releaseAgent: (sessionId: string) => void;
   loadHistory: (sessionId: string) => Promise<SessionHistoryView>;
+  // Web 只提供 MEMORY.md 和最近每日记忆的读取视图；写入统一由 workspace 文件工具承担。
+  loadMemory: () => Promise<WorkspaceMemoryContext>;
   confirmationTimeoutMs?: number;
   page?: string;
 }
@@ -99,6 +102,11 @@ async function routeRequest(
 
   if (request.method === "GET" && url.pathname === "/api/sessions") {
     writeJson(response, 200, { sessions: await options.listSessions() });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/memory") {
+    writeJson(response, 200, { memory: await options.loadMemory() });
     return;
   }
 

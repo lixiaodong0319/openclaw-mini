@@ -60,7 +60,62 @@ describe("workspace instructions", () => {
     expect(prompt).toContain('<workspace_instructions file="AGENTS.md">');
     expect(prompt).toContain("Run tests before reporting completion.");
     expect(prompt).toContain("</workspace_instructions>");
-    expect(buildSystemPrompt()).toBe(DEFAULT_SYSTEM_PROMPT);
+    expect(buildSystemPrompt()).toContain(DEFAULT_SYSTEM_PROMPT);
+    expect(buildSystemPrompt()).toContain("MEMORY.md");
+    expect(buildSystemPrompt()).toContain("memory_search");
+    expect(buildSystemPrompt()).toContain("memory_get");
+  });
+
+  it("adds MEMORY.md Markdown as bounded user context", () => {
+    const prompt = buildSystemPrompt(undefined, {
+      longTerm: {
+        relativePath: "MEMORY.md",
+        content: "# Memory\n\n- 请使用中文回答。\n",
+        bytes: 38,
+        injectedBytes: 38,
+        truncated: false,
+      },
+      daily: [],
+      today: "2026-08-13",
+      yesterday: "2026-08-12",
+      discoveredDailyFiles: 0,
+      dailyTruncated: false,
+    });
+
+    expect(prompt).toContain('<long_term_memory file="MEMORY.md">');
+    expect(prompt).toContain("# Memory");
+    expect(prompt).toContain("请使用中文回答。");
+    expect(prompt.endsWith("</long_term_memory>")).toBe(true);
+  });
+
+  it("adds today and yesterday daily Markdown as separate context", () => {
+    const prompt = buildSystemPrompt(undefined, {
+      longTerm: undefined,
+      daily: [{
+        relativePath: "memory/2026-08-12.md",
+        date: "2026-08-12",
+        content: "- Yesterday detail.\n",
+        bytes: 20,
+        injectedBytes: 20,
+        truncated: false,
+      }, {
+        relativePath: "memory/2026-08-13-session.md",
+        date: "2026-08-13",
+        content: "- Today detail.\n",
+        bytes: 16,
+        injectedBytes: 16,
+        truncated: false,
+      }],
+      today: "2026-08-13",
+      yesterday: "2026-08-12",
+      discoveredDailyFiles: 2,
+      dailyTruncated: false,
+    });
+
+    expect(prompt).toContain("memory/YYYY-MM-DD.md");
+    expect(prompt).toContain('file="memory/2026-08-12.md"');
+    expect(prompt).toContain('file="memory/2026-08-13-session.md"');
+    expect(prompt.indexOf("Yesterday detail")).toBeLessThan(prompt.indexOf("Today detail"));
   });
 
   it("rejects a file larger than 32 KiB", async () => {

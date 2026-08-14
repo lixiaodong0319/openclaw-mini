@@ -12,12 +12,14 @@
 - OpenAI 默认模型为 `gpt-5.3-codex`
 - 启动时读取 `workspace/AGENTS.md`，作为 CLI 与 Web 共用的工作区指令
 - 从项目根目录的 `mcp.json` 连接 stdio 或 Streamable HTTP MCP Server，并动态加载工具
-- 十三个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
+- 十五个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
   - `find_files`：按 glob 递归查找 `workspace/` 内的文件路径
   - `search_files`：递归搜索 `workspace/` 内的文本内容
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
+  - `memory_search`：用本地 SQLite FTS5/BM25 索引检索全部 Markdown 记忆
+  - `memory_get`：从 Markdown 真相源读取精确行范围
   - `git_status`：查看 `workspace/` 内 Git 仓库的分支和文件状态
   - `git_diff`：查看 `workspace/` 内 Git 仓库的暂存或未暂存差异
   - `create_directory`：确认后递归创建 `workspace/` 内的目录
@@ -28,6 +30,7 @@
   - `fetch_url`：确认后读取公网 HTTP/HTTPS URL 的文本内容
   - `run_command`：确认后从 `workspace/` 启动 Shell 命令，用于构建、测试和代码检查
 - JSONL 会话持久化，支持重启后继续同一 session
+- 用户可管理的长期记忆，独立保存并在所有 Session 中生效
 - 长会话自动摘要压缩，保留最近完整轮次和工具调用链
 - Fake Provider 测试，不依赖真实 API Key 或网络
 - TypeScript 严格类型检查
@@ -38,7 +41,7 @@
 - OpenClaw Gateway / daemon
 - Slack、Discord、Telegram 等消息渠道
 - 文件删除或重命名工具
-- 浏览器、多 Agent、记忆系统
+- 浏览器、多 Agent
 - 模型 fallback、成本路由
 
 ## 目录结构
@@ -53,6 +56,8 @@ src/
   fetch-url.ts       公网文本请求、DNS 固定和 SSRF 防护
   git-tools.ts       只读 Git 状态、差异和进程安全边界
   mcp.ts             MCP 配置、stdio/HTTP 连接、工具发现与调用适配
+  memory-index.ts    Markdown 记忆分块、SQLite FTS5/BM25 索引与读取
+  workspace-memory.ts workspace/MEMORY.md 的加载、校验和注入预算
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
   session-history.ts 两种 Provider 原生历史到安全展示视图的转换
@@ -73,6 +78,8 @@ test/
   fetch-url.test.ts      URL、重定向、地址和内容边界测试
   git-tools.test.ts      临时 Git 仓库与只读边界测试
   mcp.test.ts            MCP 配置、工具发现、调用与关闭测试
+  memory-index.test.ts   记忆索引、同步、搜索和原文读取测试
+  workspace-memory.test.ts MEMORY.md 加载、UTF-8 边界和截断测试
   session-store.test.ts  会话存储测试
   session-history.test.ts 会话历史展示转换测试
   tools.test.ts          工具边界测试
@@ -80,7 +87,7 @@ test/
   workspace-instructions.test.ts 工作区指令加载与安全边界测试
 
 workspace/            Agent 可读取的工作区
-data/                 本地会话历史，已被 .gitignore 忽略
+data/                 本地会话历史和可重建记忆索引，已被 .gitignore 忽略
 ```
 
 ## 安装
@@ -207,6 +214,34 @@ CLI 和 Web 启动时读取这一份文件，并把内容和默认系统提示�
 
 只读取 `workspace/AGENTS.md`，不会递归查找子目录或父目录。文件必须是最大 32 KiB 的普通 UTF-8 文本，符号链接、目录、NUL 二进制内容和非法 UTF-8 会使启动失败。指令不会写入 Session JSONL，也不参与会话压缩；修改文件后需要重启 CLI 或 Web 才会生效。
 
+### 长期记忆
+
+长期记忆使用 OpenClaw 风格的 Markdown 真相源：`workspace/MEMORY.md`。可以直接编辑：
+
+```markdown
+# Long-term memory
+
+- Prefer TypeScript for new projects.
+- Run tests before reporting completion.
+```
+
+第二层是每日记忆，用于保存详细运行上下文、观察和当日记录：
+
+```text
+workspace/memory/
+  2026-08-12.md
+  2026-08-13.md
+  2026-08-13-session-a.md
+```
+
+Agent 会自动加载本机日期中今天和昨天的 `YYYY-MM-DD.md` 以及同日 slug 变体。更早文件继续保留在磁盘，但不在这一阶段自动注入。每日记忆最多加载 20 个文件，所有加载文件共享 32 KiB 注入预算，预算不足时优先今天。
+
+可以在对话中说“记住我喜欢 TypeScript”或“把今天的调试结果记录下来”。Agent 会根据内容选择精炼的 `MEMORY.md` 或当日 `memory/YYYY-MM-DD.md`，并调用 workspace 文件工具创建或编辑；实际写入前仍需用户确认。`/memory` 和 Web 页面的“查看记忆”会展示当前注入的长期与每日记忆。
+
+AgentLoop 在每次模型调用前重新读取这两层文件，因此手工或工具编辑后无需重启。记忆在 Anthropic/OpenAI 和所有 Session 中共享，不写入 Session JSONL，也不会被会话压缩。磁盘原文不会被截断；`MEMORY.md` 另有 32 KiB 注入预算。
+
+启动时会把 `MEMORY.md` 和所有直属 `memory/*.md` 分块写入 `data/memory/index.sqlite`。`memory_search` 使用 SQLite FTS5 trigram tokenizer 和 BM25 排序，因此可以找到未注入提示词的旧日期记录；不足 3 个字符的短查询会回退为字面量匹配。找到候选后，`memory_get` 直接从 Markdown 原文读取指定行，不把 SQLite 当作真相源。每次搜索前都会用 SHA-256 检查文件变化，文件工具写入后还会触发 250 ms 防抖同步；数据库被删除或 schema 变化时可自动重建。目前尚未实现向量检索和压缩前 memory flush。
+
 ### 上下文压缩配置
 
 历史记录默认超过约 320,000 tokens 时，会在下一轮开始前调用当前 Provider 生成早期会话摘要，并保留最近 4 个完整用户轮次。可通过环境变量调整：
@@ -254,12 +289,13 @@ pnpm dev -- --session smoke
 /status     查看当前 Provider、模型、Session、workspace 和指令状态
 /history    查看当前 Session 的安全历史视图
 /mcp        查看已连接的 MCP Server 和工具
+/memory     查看长期记忆
 /compact    手动压缩早期会话历史
 /clear      清空当前 Session 历史（需要确认）
 /exit       退出
 ```
 
-未知的 `/命令` 不会发送给模型。内置命令目前不接受参数，命令名不区分大小写。
+未知的 `/命令` 不会发送给模型。需要参数的命令会在 `/help` 中标出，命令名不区分大小写。
 
 `/mcp` 显示启动时已经连接的 Server，并按 Server 分组列出模型实际可见的 MCP 工具名称和描述。它不会重新启动 Server、重新发现工具或执行工具，也不会展示 `mcp.json` 中的命令、环境变量和凭据。
 
@@ -282,7 +318,7 @@ workspace 中包含 note.txt。
 [会话] 上下文压缩完成（328400 → 62100 tokens）
 ```
 
-`calculator`、`list_directory`、`find_files`、`search_files`、`read_text_file`、`git_status` 和 `git_diff` 是无副作用工具，会自动执行。`create_directory`、`write_text_file`、`edit_text_file`、`apply_patch`、`fetch_url` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
+`calculator`、`list_directory`、`find_files`、`search_files`、`read_text_file`、`memory_search`、`memory_get`、`git_status` 和 `git_diff` 是无副作用工具，会自动执行。`create_directory`、`write_text_file`、`edit_text_file`、`apply_patch`、`fetch_url` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
 
 ```text
 [工具] write_text_file 等待确认
@@ -403,7 +439,7 @@ pnpm test         运行测试
 
 ## 安全边界
 
-当前版本暴露七个自动放行工具，以及六个每次都需确认的目录创建、文件修改、网络和 Shell 工具。OpenAI 模式还启用由 Responses API 托管的原生 Web Search。模型无法控制浏览器；文件工具无法读写 workspace 外文件。
+当前版本暴露九个自动放行工具，以及六个每次都需确认的目录创建、文件修改、网络和 Shell 工具。OpenAI 模式还启用由 Responses API 托管的原生 Web Search。模型无法控制浏览器；文件工具无法读写 workspace 外文件。
 
 工具权限采用安全默认值：已登记的纯计算和只读工具自动放行，所有未登记工具都必须经过用户确认。拒绝后不会调用工具实现，而是把拒绝结果回填给模型，让模型继续回复。
 
@@ -457,6 +493,7 @@ pnpm run build
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic/OpenAI 会话历史统一展示与内部数据过滤
 - Anthropic 和 OpenAI 历史摘要压缩与最近工具链保留
+- Markdown 记忆的 SQLite FTS5/BM25 派生索引、变更同步、旧记录检索和按行读取
 - CLI 命令解析、安全历史展示、阈值外手动压缩和原子清空
 - 压缩后 JSONL 历史原子替换
 - 旧 Anthropic 会话向独立目录的无覆盖迁移

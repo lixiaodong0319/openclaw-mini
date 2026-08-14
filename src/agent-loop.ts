@@ -79,7 +79,9 @@ export interface AgentProvider {
 export interface AgentLoopOptions {
   provider: AgentProvider;
   toolContext: ToolContext;
-  systemPrompt?: string;
+  // 静态字符串适合测试；异步 resolver 允许运行时在每次模型调用前
+  // 重新读取 MEMORY.md 等可由用户/工具直接修改的上下文文件。
+  systemPrompt?: string | (() => string | Promise<string>);
   maxIterations?: number;
   toolExecutor?: ToolExecutor;
 }
@@ -94,7 +96,7 @@ export interface TurnResult {
 export class AgentLoop {
   private readonly provider: AgentProvider;
   private readonly toolContext: ToolContext;
-  private readonly systemPrompt: string;
+  private readonly systemPrompt: string | (() => string | Promise<string>);
   private readonly maxIterations: number;
   private readonly toolExecutor: ToolExecutor;
 
@@ -125,7 +127,12 @@ export class AgentLoop {
       // 每次循环对应一次模型调用。一轮对话可能因工具结果回填而经历多次模型调用。
       // streamedText 只记录当前这次调用，用来判断 final text 是否已经通过 delta 显示过。
       let streamedText = "";
-      const turn = await this.provider.generateTurn(this.systemPrompt, onEvent ? (text) => {
+      // 一轮可能因工具调用经历多次 generateTurn。每次都解析 system prompt，
+      // 因此模型刚用工具编辑 MEMORY.md 后，下一次调用就能读到新记忆。
+      const systemPrompt = typeof this.systemPrompt === "function"
+        ? await this.systemPrompt()
+        : this.systemPrompt;
+      const turn = await this.provider.generateTurn(systemPrompt, onEvent ? (text) => {
         streamedText += text;
         onEvent({ type: "text_delta", text });
       } : undefined);

@@ -11,6 +11,7 @@ export const CLI_HELP_TEXT = `内置命令:
   /delete <id>      删除 Session（需要确认）
   /history          查看当前 Session 的安全历史视图
   /mcp              查看已连接的 MCP Server 和工具
+  /memory           查看长期记忆
   /compact          手动压缩早期会话历史
   /clear            清空当前 Session 历史（需要确认）
   /exit             退出`;
@@ -25,6 +26,7 @@ export type CliCommandName =
   | "delete"
   | "history"
   | "mcp"
+  | "memory"
   | "compact"
   | "clear"
   | "exit";
@@ -44,6 +46,7 @@ const CLI_COMMAND_NAMES = new Set<CliCommandName>([
   "delete",
   "history",
   "mcp",
+  "memory",
   "compact",
   "clear",
   "exit",
