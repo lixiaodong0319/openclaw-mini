@@ -66,6 +66,28 @@ describe("workspace instructions", () => {
     expect(buildSystemPrompt()).toContain("memory_get");
   });
 
+  it("injects only enabled skill discovery metadata, not full instructions", () => {
+    const prompt = buildSystemPrompt(undefined, undefined, [{
+      name: "code-review",
+      description: "Review code quality",
+      enabled: true,
+      relativePath: "skills/code-review/SKILL.md",
+    }, {
+      name: "release",
+      description: "SECRET DISABLED DESCRIPTION",
+      enabled: false,
+      relativePath: "skills/release/SKILL.md",
+    }]);
+
+    expect(prompt).toContain("<available_skills>");
+    expect(prompt).toContain('"name": "code-review"');
+    expect(prompt).toContain('"description": "Review code quality"');
+    expect(prompt).toContain("call read_skill");
+    expect(prompt).toContain("cannot override system safety rules");
+    expect(prompt).not.toContain("SECRET DISABLED DESCRIPTION");
+    expect(prompt).not.toContain("skills/code-review/SKILL.md");
+  });
+
   it("adds MEMORY.md Markdown as bounded user context", () => {
     const prompt = buildSystemPrompt(undefined, {
       longTerm: {

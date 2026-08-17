@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { executeTool, requiresToolConfirmation } from "../src/tools.js";
+import {
+  executeTool,
+  openAIToolDefinitions,
+  requiresToolConfirmation,
+  toolDefinitions,
+} from "../src/tools.js";
 
 describe("tools", () => {
   let workspaceRoot: string;
@@ -641,6 +646,39 @@ describe("tools", () => {
     expect(memoryIndex.get).toHaveBeenCalledWith("MEMORY.md", 1, 80);
   });
 
+  it("dispatches read_skill through the runtime skill service", async () => {
+    const skills = {
+      readSkill: vi.fn(async (name: string) => `[Skill] ${name}`),
+    };
+
+    await expect(executeTool(
+      "read_skill",
+      { name: "code-review" },
+      { workspaceRoot, skills },
+    )).resolves.toBe("[Skill] code-review");
+    expect(skills.readSkill).toHaveBeenCalledWith("code-review");
+
+    await expect(executeTool(
+      "read_skill",
+      { name: 123 },
+      { workspaceRoot, skills },
+    )).rejects.toThrow("string name");
+    await expect(executeTool(
+      "read_skill",
+      { name: "code-review" },
+      { workspaceRoot },
+    )).rejects.toThrow("skill manager is not configured");
+  });
+
+  it("exposes read_skill to both Anthropic and OpenAI Providers", () => {
+    expect(toolDefinitions).toContainEqual(expect.objectContaining({ name: "read_skill" }));
+    expect(openAIToolDefinitions).toContainEqual(expect.objectContaining({
+      type: "function",
+      name: "read_skill",
+      strict: true,
+    }));
+  });
+
   it("schedules a derived memory-index sync after successful file writes", async () => {
     const memoryIndex = {
       search: vi.fn(),
@@ -663,6 +701,7 @@ describe("tools", () => {
     expect(requiresToolConfirmation("find_files")).toBe(false);
     expect(requiresToolConfirmation("search_files")).toBe(false);
     expect(requiresToolConfirmation("read_text_file")).toBe(false);
+    expect(requiresToolConfirmation("read_skill")).toBe(false);
     expect(requiresToolConfirmation("memory_search")).toBe(false);
     expect(requiresToolConfirmation("memory_get")).toBe(false);
     expect(requiresToolConfirmation("git_status")).toBe(false);

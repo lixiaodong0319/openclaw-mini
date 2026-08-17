@@ -16,6 +16,7 @@ import {
   MAX_MEMORY_SEARCH_RESULTS,
   type MemoryToolService,
 } from "./memory-index.js";
+import type { SkillToolService } from "./skills.js";
 
 // 直接复用 SDK 的 Tool 类型，确保工具定义形状和 Anthropic SDK 保持一致。
 // 不额外声明自定义 Tool interface，可以避免 SDK 升级后字段含义或类型漂移。
@@ -39,6 +40,9 @@ export interface ToolContext {
   // 记忆索引由 Runtime 创建并注入。直接单测普通文件工具时可以省略；只有两个
   // memory_* 工具会要求它存在，模型不能通过参数替换 workspace 或数据库位置。
   memoryIndex?: MemoryToolService;
+  // Skill Manager 与记忆索引一样由 Runtime 可信注入。read_skill 只接受技能名，
+  // 具体目录、文件名和启用状态都由服务端重新扫描、校验，模型不能传入任意路径。
+  skills?: SkillToolService;
 }
 
 // read_text_file 的模型输入结构。
@@ -107,6 +111,10 @@ interface MemoryGetInput {
   lines: number;
 }
 
+interface ReadSkillInput {
+  name: string;
+}
+
 interface GitStatusInput {
   path: string;
 }
@@ -167,7 +175,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 // 这不是 Shell 沙箱，而是防止 `env` 等普通命令直接暴露 API Key 的额外防线。
 const SENSITIVE_ENVIRONMENT_NAME = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|AUTHORIZATION|COOKIE|SESSION|JWT)(?:_|$)/i;
 
-// 当前九个工具都是只读或纯计算能力，可以直接执行。
+// 当前十个工具都是只读或纯计算能力，可以直接执行。
 // 未登记的新工具默认需要用户确认，避免未来加入写文件、Shell 等能力时意外绕过审批。
 const AUTO_APPROVED_TOOLS = new Set([
   "calculator",
@@ -175,6 +183,7 @@ const AUTO_APPROVED_TOOLS = new Set([
   "find_files",
   "search_files",
   "read_text_file",
+  "read_skill",
   "memory_search",
   "memory_get",
   "git_status",
@@ -298,6 +307,22 @@ export const toolDefinitions: ToolDefinition[] = [
         },
       },
       required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "read_skill",
+    description: "Load the complete instructions for one enabled workspace skill after its name and description in the system skill catalog match the user's task. This tool is read-only. Call it before claiming to follow that skill.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Exact enabled skill name from the available_skills catalog.",
+        },
+      },
+      required: ["name"],
       additionalProperties: false,
     },
   },
@@ -545,6 +570,8 @@ export async function executeTool(
       return searchFiles(parseSearchFilesInput(input), context);
     case "read_text_file":
       return readTextFile(parseReadTextFileInput(input), context);
+    case "read_skill":
+      return requireSkillService(context).readSkill(parseReadSkillInput(input).name);
     case "memory_search": {
       const parsed = parseMemorySearchInput(input);
       const result = await requireMemoryIndex(context).search(parsed.query, parsed.maxResults);
@@ -674,6 +701,20 @@ function parseReadTextFileInput(input: unknown): ReadTextFileInput {
   }
 
   return { path: input.path };
+}
+
+function parseReadSkillInput(input: unknown): ReadSkillInput {
+  if (!isRecord(input) || typeof input.name !== "string") {
+    throw new Error("read_skill requires a string name");
+  }
+  return { name: input.name };
+}
+
+function requireSkillService(context: ToolContext): SkillToolService {
+  if (!context.skills) {
+    throw new Error("skill manager is not configured");
+  }
+  return context.skills;
 }
 
 function parseMemorySearchInput(input: unknown): MemorySearchInput {

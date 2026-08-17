@@ -1,6 +1,7 @@
 import {
   CLI_HELP_TEXT,
   formatMcpStatus,
+  formatSkillsStatus,
   formatSessionList,
   formatSessionHistory,
   isCliCommandName,
@@ -26,6 +27,7 @@ describe("CLI commands", () => {
       "delete",
       "history",
       "mcp",
+      "skills",
       "memory",
       "compact",
       "clear",
@@ -73,6 +75,25 @@ describe("CLI commands", () => {
   it("formats an empty MCP status", () => {
     expect(formatMcpStatus({ serverCount: 0, toolCount: 0, servers: [] }))
       .toContain("未连接 Server");
+  });
+
+  it("formats enabled and disabled workspace skills", () => {
+    const output = formatSkillsStatus([{
+      name: "review",
+      description: "Review changed code",
+      enabled: true,
+      relativePath: "skills/review/SKILL.md",
+    }, {
+      name: "release",
+      description: "Publish a release",
+      enabled: false,
+      relativePath: "skills/release/SKILL.md",
+    }]);
+
+    expect(output).toContain("[Skills] 1 enabled, 1 disabled");
+    expect(output).toContain("[启用] review");
+    expect(output).toContain("[禁用] release");
+    expect(formatSkillsStatus([])).toContain("未发现技能");
   });
 
   it("formats the safe history view for terminal display", () => {

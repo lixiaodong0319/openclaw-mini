@@ -1,5 +1,6 @@
 import type { HistoryEntry, SessionHistoryView } from "./session-history.js";
 import type { McpStatusView } from "./mcp.js";
+import type { WorkspaceSkill } from "./skills.js";
 
 export const CLI_HELP_TEXT = `内置命令:
   /help             查看命令帮助
@@ -11,6 +12,7 @@ export const CLI_HELP_TEXT = `内置命令:
   /delete <id>      删除 Session（需要确认）
   /history          查看当前 Session 的安全历史视图
   /mcp              查看已连接的 MCP Server 和工具
+  /skills           查看已发现的 workspace Skills
   /memory           查看长期记忆
   /memory consolidate 预览并确认把每日记忆整理到 MEMORY.md
   /compact          保存压缩前记忆并手动压缩早期会话历史
@@ -27,6 +29,7 @@ export type CliCommandName =
   | "delete"
   | "history"
   | "mcp"
+  | "skills"
   | "memory"
   | "compact"
   | "clear"
@@ -47,6 +50,7 @@ const CLI_COMMAND_NAMES = new Set<CliCommandName>([
   "delete",
   "history",
   "mcp",
+  "skills",
   "memory",
   "compact",
   "clear",
@@ -108,6 +112,23 @@ export function formatMcpStatus(status: McpStatusView): string {
     }
   }
   return blocks.join("\n");
+}
+
+export function formatSkillsStatus(skills: readonly WorkspaceSkill[]): string {
+  if (skills.length === 0) {
+    return "[Skills] 未发现技能；请在 workspace/skills/<name>/SKILL.md 中添加。";
+  }
+
+  const enabledCount = skills.filter((skill) => skill.enabled).length;
+  const lines = [
+    `[Skills] ${enabledCount} enabled, ${skills.length - enabledCount} disabled`,
+  ];
+  for (const skill of skills) {
+    lines.push(
+      `  - [${skill.enabled ? "启用" : "禁用"}] ${skill.name}\n    ${limitDescription(skill.description)}`,
+    );
+  }
+  return lines.join("\n");
 }
 
 function formatHistoryEntry(entry: HistoryEntry): string {

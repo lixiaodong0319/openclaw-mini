@@ -115,6 +115,8 @@ async function main(): Promise<void> {
   const workspaceMemory = await loadWorkspaceMemoryContext(config.workspaceRoot);
   console.log(`Memory: ${describeWorkspaceMemory(workspaceMemory.longTerm)}`);
   console.log(`Daily memory: ${describeDailyMemories(workspaceMemory)}`);
+  const skills = await preparation.skillManager.loadCatalog();
+  console.log(`Skills: ${skills.filter((skill) => skill.enabled).length} enabled, ${skills.filter((skill) => !skill.enabled).length} disabled`);
   console.log(`MCP: ${preparation.mcp.serverCount} server(s), ${preparation.mcp.toolCount} tool(s)`);
   console.log("按 Ctrl+C 退出。");
 }

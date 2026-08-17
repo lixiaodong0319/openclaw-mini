@@ -11,13 +11,15 @@
 - 单一 Agent Loop，通过 Provider 适配 Anthropic Messages API 和 OpenAI Responses API
 - OpenAI 默认模型为 `gpt-5.3-codex`
 - 启动时读取 `workspace/AGENTS.md`，作为 CLI 与 Web 共用的工作区指令
+- 扫描 `workspace/skills/*/SKILL.md`，按需加载可热刷新的任务技能
 - 从项目根目录的 `mcp.json` 连接 stdio 或 Streamable HTTP MCP Server，并动态加载工具
-- 十五个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
+- 十六个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
   - `find_files`：按 glob 递归查找 `workspace/` 内的文件路径
   - `search_files`：递归搜索 `workspace/` 内的文本内容
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
+  - `read_skill`：按名称读取已启用 Skill 的完整工作流指令
   - `memory_search`：用 SQLite FTS5/BM25 与可选 Embedding 混合检索全部 Markdown 记忆
   - `memory_get`：从 Markdown 真相源读取精确行范围
   - `git_status`：查看 `workspace/` 内 Git 仓库的分支和文件状态
@@ -61,6 +63,7 @@ src/
   memory-index.ts    Markdown 分块、FTS5/BM25 与向量混合检索
   memory-flush.ts    压缩摘要的每日记忆落盘、去重和并发写入
   memory-consolidation.ts 每日记忆到 MEMORY.md 的提案、校验和确认写入
+  skills.ts          workspace Skills 扫描、校验和按需读取
   workspace-memory.ts workspace/MEMORY.md 的加载、校验和注入预算
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
@@ -86,6 +89,7 @@ test/
   memory-index.test.ts   记忆索引、同步、搜索和原文读取测试
   memory-flush.test.ts   压缩前记忆落盘、去重和安全边界测试
   memory-consolidation.test.ts 长期记忆整理、并发保护和凭据拦截测试
+  skills.test.ts        Skills 发现、热刷新和安全边界测试
   workspace-memory.test.ts MEMORY.md 加载、UTF-8 边界和截断测试
   session-store.test.ts  会话存储测试
   session-history.test.ts 会话历史展示转换测试
@@ -221,6 +225,28 @@ CLI 和 Web 启动时读取这一份文件，并把内容和默认系统提示�
 
 只读取 `workspace/AGENTS.md`，不会递归查找子目录或父目录。文件必须是最大 32 KiB 的普通 UTF-8 文本，符号链接、目录、NUL 二进制内容和非法 UTF-8 会使启动失败。指令不会写入 Session JSONL，也不参与会话压缩；修改文件后需要重启 CLI 或 Web 才会生效。
 
+### Skills 技能
+
+任务型工作流可以放在 `workspace/skills/<name>/SKILL.md`。例如：
+
+```markdown
+---
+name: code-review
+description: 审查代码质量、潜在缺陷和测试覆盖
+enabled: true
+---
+
+# Code review
+
+1. 先查看 Git 状态和差异。
+2. 按严重程度列出问题并标注文件位置。
+3. 检查相关测试是否覆盖修改。
+```
+
+`name` 必须与目录名完全一致，只能包含字母、数字、`_` 和 `-`，最长 64 个字符；`description` 必填，`enabled` 可省略且默认为 `true`。每个 `SKILL.md` 最大 64 KiB，最多发现 50 个技能。skills 根目录、技能目录和 `SKILL.md` 都不允许使用符号链接。
+
+启动时以及每次模型请求前都会重新扫描技能目录，因此新增、修改、启用或禁用 Skill 后无需重启。系统提示词只注入启用技能的 `name` 和 `description`；模型判断任务匹配后，会调用只读且自动放行的 `read_skill` 获取完整正文。Skill 是用户管理的工作流指令，不能覆盖系统安全边界，也不能绕过写文件、网络、Shell 或 MCP 工具的确认机制。CLI 输入 `/skills` 可以查看当前发现的启用和禁用技能。
+
 ### 长期记忆
 
 长期记忆使用 OpenClaw 风格的 Markdown 真相源：`workspace/MEMORY.md`。可以直接编辑：
@@ -313,6 +339,7 @@ pnpm dev -- --session smoke
 /status     查看当前 Provider、模型、Session、workspace 和指令状态
 /history    查看当前 Session 的安全历史视图
 /mcp        查看已连接的 MCP Server 和工具
+/skills     查看已发现的 workspace Skills
 /memory     查看长期记忆
 /memory consolidate 预览并确认把每日记忆整理到 MEMORY.md
 /compact    保存压缩前记忆并手动压缩早期会话历史
@@ -464,7 +491,7 @@ pnpm test         运行测试
 
 ## 安全边界
 
-当前版本暴露九个自动放行工具，以及六个每次都需确认的目录创建、文件修改、网络和 Shell 工具。OpenAI 模式还启用由 Responses API 托管的原生 Web Search。模型无法控制浏览器；文件工具无法读写 workspace 外文件。
+当前版本暴露十个自动放行工具，以及六个每次都需确认的目录创建、文件修改、网络和 Shell 工具。OpenAI 模式还启用由 Responses API 托管的原生 Web Search。模型无法控制浏览器；文件工具无法读写 workspace 外文件。
 
 工具权限采用安全默认值：已登记的纯计算和只读工具自动放行，所有未登记工具都必须经过用户确认。拒绝后不会调用工具实现，而是把拒绝结果回填给模型，让模型继续回复。
 

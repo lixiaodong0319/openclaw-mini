@@ -7,6 +7,7 @@ import {
 import {
   CLI_HELP_TEXT,
   formatMcpStatus,
+  formatSkillsStatus,
   formatSessionList,
   formatSessionHistory,
   isCliCommandName,
@@ -50,6 +51,8 @@ async function main(): Promise<void> {
   console.log(`Instructions: ${describeWorkspaceInstructions(runtime.workspaceInstructions)}`);
   console.log(`Memory: ${describeWorkspaceMemory(runtime.workspaceMemory.longTerm)}`);
   console.log(`Daily memory: ${describeDailyMemories(runtime.workspaceMemory)}`);
+  const startupSkills = await runtime.skillManager.loadCatalog();
+  console.log(`Skills: ${startupSkills.filter((skill) => skill.enabled).length} enabled, ${startupSkills.filter((skill) => !skill.enabled).length} disabled`);
   console.log(`MCP: ${runtime.mcp.serverCount} server(s), ${runtime.mcp.toolCount} tool(s)`);
   console.log("输入 /help 查看命令，输入 /exit 退出。\n");
 
@@ -148,6 +151,7 @@ async function executeCliCommand(
 
   if (command === "status") {
     const memory = await loadWorkspaceMemoryContext(context.config.workspaceRoot);
+    const skills = await context.runtime.skillManager.loadCatalog();
     output.write(`[状态]
 Session: ${context.runtime.sessionId}
 Provider: ${context.config.providerName}
@@ -155,7 +159,8 @@ Model: ${context.config.model}
 Workspace: ${context.config.workspaceRoot}
 Instructions: ${context.instructions}
 Memory: ${describeWorkspaceMemory(memory.longTerm)}
-Daily memory: ${describeDailyMemories(memory)}\n\n`);
+Daily memory: ${describeDailyMemories(memory)}
+Skills: ${skills.filter((skill) => skill.enabled).length} enabled, ${skills.filter((skill) => !skill.enabled).length} disabled\n\n`);
     return undefined;
   }
 
@@ -242,6 +247,12 @@ Daily memory: ${describeDailyMemories(memory)}\n\n`);
     return undefined;
   }
 
+  if (command === "skills") {
+    const skills = await context.runtime.skillManager.loadCatalog();
+    output.write(`${formatSkillsStatus(skills)}\n\n`);
+    return undefined;
+  }
+
   if (command === "memory") {
     const memoryAction = argument.toLowerCase();
     if (memoryAction.length > 0 && memoryAction !== "consolidate") {
@@ -325,13 +336,14 @@ function createSharedAgentRuntime(
   sessionId: string,
   context: CliCommandContext,
 ): Promise<AgentRuntime> {
-  // workspaceInstructions 是启动快照，记忆索引和 MCP 由各 Session 共享；MEMORY.md 由 AgentLoop
-  // 在每次模型调用前重新加载，无需从旧 runtime 传入。
+  // workspaceInstructions 是启动快照；记忆服务、Skill Manager 和 MCP 由各 Session 共享。
+  // MEMORY.md 与技能目录由 AgentLoop 在每次模型调用前重新加载，无需复制内容快照。
   return createAgentRuntime(sessionId, context.config, {
     workspaceInstructions: context.runtime.workspaceInstructions,
     memoryIndex: context.runtime.memoryIndex,
     memoryFlusher: context.runtime.memoryFlusher,
     memoryConsolidator: context.runtime.memoryConsolidator,
+    skillManager: context.runtime.skillManager,
     mcp: context.runtime.mcp,
   });
 }

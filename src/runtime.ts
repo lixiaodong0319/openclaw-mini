@@ -23,6 +23,7 @@ import { McpManager } from "./mcp.js";
 import { resolveMemoryEmbeddingEnvironment } from "./embedding.js";
 import { WorkspaceMemoryFlusher } from "./memory-flush.js";
 import { WorkspaceMemoryConsolidator } from "./memory-consolidation.js";
+import { WorkspaceSkillManager } from "./skills.js";
 import {
   MEMORY_INDEX_RELATIVE_PATH,
   WorkspaceMemoryIndex,
@@ -55,6 +56,7 @@ export interface AgentRuntime extends RuntimeConfig {
   memoryIndex: WorkspaceMemoryIndex;
   memoryFlusher: WorkspaceMemoryFlusher;
   memoryConsolidator: WorkspaceMemoryConsolidator;
+  skillManager: WorkspaceSkillManager;
   mcp: McpManager;
 }
 
@@ -63,6 +65,7 @@ export interface RuntimePreparation {
   memoryIndex: WorkspaceMemoryIndex;
   memoryFlusher: WorkspaceMemoryFlusher;
   memoryConsolidator: WorkspaceMemoryConsolidator;
+  skillManager: WorkspaceSkillManager;
   mcp: McpManager;
 }
 
@@ -103,6 +106,7 @@ export async function createAgentRuntime(
       prepared.memoryIndex,
       prepared.memoryFlusher,
       prepared.memoryConsolidator,
+      prepared.skillManager,
       prepared.mcp,
     );
   } catch (error) {
@@ -122,6 +126,7 @@ export async function createAgentRuntime(
     memoryIndex: prepared.memoryIndex,
     memoryFlusher: prepared.memoryFlusher,
     memoryConsolidator: prepared.memoryConsolidator,
+    skillManager: prepared.skillManager,
     workspaceMemory,
     mcp: prepared.mcp,
   };
@@ -154,12 +159,17 @@ export async function prepareRuntime(config: RuntimeConfig): Promise<RuntimePrep
     config.workspaceRoot,
     () => memoryIndex.scheduleSync(),
   );
+  // Manager 不缓存目录或正文；这里先扫描一次让配置错误在启动阶段尽早暴露，
+  // 后续每次模型调用和 /skills 命令仍会重新扫描以支持热刷新。
+  const skillManager = new WorkspaceSkillManager(config.workspaceRoot);
   try {
+    await skillManager.loadCatalog();
     return {
       workspaceInstructions: await loadWorkspaceInstructions(config.workspaceRoot),
       memoryIndex,
       memoryFlusher,
       memoryConsolidator,
+      skillManager,
       mcp: await McpManager.load(config.projectRoot),
     };
   } catch (error) {
@@ -178,6 +188,7 @@ async function createAgent(
   memoryIndex?: WorkspaceMemoryIndex,
   memoryFlusher?: WorkspaceMemoryFlusher,
   memoryConsolidator?: WorkspaceMemoryConsolidator,
+  skillManager?: WorkspaceSkillManager,
   mcp?: McpManager,
 ): Promise<AgentLoop> {
   const compaction = getContextCompactionOptions();
@@ -187,12 +198,14 @@ async function createAgent(
   const systemPrompt = async (): Promise<string> => buildSystemPrompt(
     workspaceInstructions,
     await loadWorkspaceMemoryContext(workspaceRoot),
+    await skillManager?.loadCatalog() ?? [],
   );
   const mcpDefinitions = mcp?.getDefinitions();
   const toolContext: ToolContext = {
     workspaceRoot,
     commandTimeoutMs: getCommandTimeoutMs(),
     memoryIndex,
+    skills: skillManager,
   };
   const toolExecutor: ToolExecutor = async (name, input, context) => {
     if (mcp?.hasTool(name)) return mcp.execute(name, input);
