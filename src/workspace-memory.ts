@@ -202,7 +202,9 @@ export function describeDailyMemories(context: WorkspaceMemoryContext): string {
   return `${context.daily.length}/${context.discoveredDailyFiles} file(s), ${injectedBytes} bytes injected${suffix}`;
 }
 
-function formatLocalDate(date: Date): string {
+// Memory Flush 与每日记忆加载必须使用完全相同的本地日期规则，否则临近午夜时可能
+// 写入一个不会被当前 bootstrap 发现的文件。导出该函数以避免复制日期算法。
+export function formatLocalDate(date: Date): string {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");

@@ -17,6 +17,10 @@ import {
   type ContextCompactionOptions,
 } from "./context-compaction.js";
 import {
+  MEMORY_CONSOLIDATION_INSTRUCTIONS,
+  MEMORY_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+} from "./memory-consolidation.js";
+import {
   openAIToolDefinitions,
   toolDefinitions,
   type OpenAIToolDefinition,
@@ -81,6 +85,7 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
   async compactHistoryIfNeeded(
     onStart?: (estimatedTokens: number) => void,
     force = false,
+    onSummary?: (summary: string) => Promise<void>,
   ): Promise<ContextCompactionResult | undefined> {
     // 第一层是廉价判断：未达阈值时不找切分点，更不发额外 API 请求。
     const beforeTokens = estimateContextTokens(this.messages);
@@ -127,6 +132,11 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
       throw new Error("context compaction returned an empty summary");
     }
 
+    // 同一份摘要既用于替换早期历史，也用于压缩前 Memory Flush。必须先等待回调，
+    // 确保历史仍完整存在时已经尝试落盘；AgentLoop 会在写入失败时自行降级，不让这里
+    // 的压缩流程被可选记忆层阻断。
+    await onSummary?.(summary);
+
     // Messages API 历史中没有可直接持久化的 system role，因此摘要用带标记的 user 消息保存。
     // 紧跟固定 assistant ACK 可以结束这个合成轮次，让 recentHistory 从 user role 正常接续。
     const replacement: Anthropic.MessageParam[] = [
@@ -148,6 +158,23 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
     // 与压缩替换保持相同顺序：磁盘写入成功后再修改内存，失败时仍可安全重试。
     await this.onHistoryReplace?.([]);
     this.messages.splice(0, this.messages.length);
+  }
+
+  async generateMemoryConsolidation(request: string): Promise<string> {
+    // 独立请求不经过 addMessage，也不携带工具，提案不会污染 Session 历史，模型也不能
+    // 绕过宿主预览直接写文件。当前对话模型与鉴权配置可直接复用。
+    const response = await this.client.createMessage({
+      model: this.model,
+      max_tokens: MEMORY_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+      system: [{ type: "text", text: MEMORY_CONSOLIDATION_INSTRUCTIONS }],
+      messages: [{ role: "user", content: [{ type: "text", text: request }] }],
+    });
+    if (response.stop_reason !== "end_turn") {
+      throw new Error(`memory consolidation ended with ${response.stop_reason ?? "unknown"}`);
+    }
+    const text = extractText(response.content);
+    if (text.length === 0) throw new Error("memory consolidation returned empty output");
+    return text;
   }
 
   async addUserText(text: string): Promise<void> {
@@ -426,6 +453,7 @@ export class OpenAIProvider implements AgentProvider {
   async compactHistoryIfNeeded(
     onStart?: (estimatedTokens: number) => void,
     force = false,
+    onSummary?: (summary: string) => Promise<void>,
   ): Promise<ContextCompactionResult | undefined> {
     // OpenAI 与 Anthropic 共用同一个估算和保留策略，但不共用历史数据格式。
     const beforeTokens = estimateContextTokens(this.input);
@@ -466,6 +494,8 @@ export class OpenAIProvider implements AgentProvider {
     if (summary.length === 0) {
       throw new Error("context compaction returned an empty summary");
     }
+    // 与 Anthropic 保持一致：先尝试把摘要写入每日记忆，再替换 Session 原生历史。
+    await onSummary?.(summary);
 
     // Responses API 允许直接回放 user input item，所以不需要 Anthropic 的合成 ACK。
     // 前缀同样会让下一次压缩忽略这条合成 user item。
@@ -485,6 +515,27 @@ export class OpenAIProvider implements AgentProvider {
   async clearHistory(): Promise<void> {
     await this.onHistoryReplace?.([]);
     this.input.splice(0, this.input.length);
+  }
+
+  async generateMemoryConsolidation(request: string): Promise<string> {
+    const response = await this.client.createResponse({
+      model: this.model,
+      instructions: MEMORY_CONSOLIDATION_INSTRUCTIONS,
+      input: [{ role: "user", content: request }],
+      tools: [],
+      max_output_tokens: MEMORY_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+    });
+    if (response.status === "failed") {
+      throw new Error(response.error?.message ?? "memory consolidation failed");
+    }
+    if (response.status === "incomplete") {
+      throw new Error(
+        `memory consolidation output is incomplete: ${response.incomplete_details?.reason ?? "unknown"}`,
+      );
+    }
+    const text = extractOpenAIText(response);
+    if (text.length === 0) throw new Error("memory consolidation returned empty output");
+    return text;
   }
 
   async addUserText(text: string): Promise<void> {

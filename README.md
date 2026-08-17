@@ -31,7 +31,8 @@
   - `run_command`：确认后从 `workspace/` 启动 Shell 命令，用于构建、测试和代码检查
 - JSONL 会话持久化，支持重启后继续同一 session
 - 用户可管理的长期记忆，独立保存并在所有 Session 中生效
-- 长会话自动摘要压缩，保留最近完整轮次和工具调用链
+- `/memory consolidate` 可预览并确认把近期每日记忆去重、整理到长期 `MEMORY.md`
+- 长会话自动摘要压缩，压缩前把摘要写入每日记忆，并保留最近完整轮次和工具调用链
 - Fake Provider 测试，不依赖真实 API Key 或网络
 - TypeScript 严格类型检查
 
@@ -58,6 +59,8 @@ src/
   git-tools.ts       只读 Git 状态、差异和进程安全边界
   mcp.ts             MCP 配置、stdio/HTTP 连接、工具发现与调用适配
   memory-index.ts    Markdown 分块、FTS5/BM25 与向量混合检索
+  memory-flush.ts    压缩摘要的每日记忆落盘、去重和并发写入
+  memory-consolidation.ts 每日记忆到 MEMORY.md 的提案、校验和确认写入
   workspace-memory.ts workspace/MEMORY.md 的加载、校验和注入预算
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
@@ -81,6 +84,8 @@ test/
   git-tools.test.ts      临时 Git 仓库与只读边界测试
   mcp.test.ts            MCP 配置、工具发现、调用与关闭测试
   memory-index.test.ts   记忆索引、同步、搜索和原文读取测试
+  memory-flush.test.ts   压缩前记忆落盘、去重和安全边界测试
+  memory-consolidation.test.ts 长期记忆整理、并发保护和凭据拦截测试
   workspace-memory.test.ts MEMORY.md 加载、UTF-8 边界和截断测试
   session-store.test.ts  会话存储测试
   session-history.test.ts 会话历史展示转换测试
@@ -238,7 +243,7 @@ workspace/memory/
 
 Agent 会自动加载本机日期中今天和昨天的 `YYYY-MM-DD.md` 以及同日 slug 变体。更早文件继续保留在磁盘，但不在这一阶段自动注入。每日记忆最多加载 20 个文件，所有加载文件共享 32 KiB 注入预算，预算不足时优先今天。
 
-可以在对话中说“记住我喜欢 TypeScript”或“把今天的调试结果记录下来”。Agent 会根据内容选择精炼的 `MEMORY.md` 或当日 `memory/YYYY-MM-DD.md`，并调用 workspace 文件工具创建或编辑；实际写入前仍需用户确认。`/memory` 和 Web 页面的“查看记忆”会展示当前注入的长期与每日记忆。
+可以在对话中说“记住我喜欢 TypeScript”或“把今天的调试结果记录下来”。Agent 会根据内容选择精炼的 `MEMORY.md` 或当日 `memory/YYYY-MM-DD.md`，并调用 workspace 文件工具创建或编辑；模型主动发起的文件写入仍需用户确认。压缩前 Memory Flush 是用户启用压缩流程后由宿主执行的固定路径追加，不经过通用写文件工具确认。`/memory` 和 Web 页面的“查看记忆”会展示当前注入的长期与每日记忆。
 
 AgentLoop 在每次模型调用前重新读取这两层文件，因此手工或工具编辑后无需重启。记忆在 Anthropic/OpenAI 和所有 Session 中共享，不写入 Session JSONL，也不会被会话压缩。磁盘原文不会被截断；`MEMORY.md` 另有 32 KiB 注入预算。
 
@@ -253,7 +258,7 @@ export OPENCLAW_EMBEDDING_MODEL="text-embedding-3-small"
 export OPENCLAW_MEMORY_VECTOR_WEIGHT="0.5"
 ```
 
-`OPENCLAW_MEMORY_VECTOR_WEIGHT` 范围为 0–1，`0` 表示只用关键词。可选的 `OPENCLAW_EMBEDDING_DIMENSIONS` 会传给支持缩短向量的第三代 Embedding 模型；`OPENCLAW_MEMORY_EMBEDDINGS=false` 可以完全关闭向量检索。Anthropic 对话模式也可单独配置 `OPENAI_API_KEY` 使用这项能力。目前尚未实现压缩前 memory flush。
+`OPENCLAW_MEMORY_VECTOR_WEIGHT` 范围为 0–1，`0` 表示只用关键词。可选的 `OPENCLAW_EMBEDDING_DIMENSIONS` 会传给支持缩短向量的第三代 Embedding 模型；`OPENCLAW_MEMORY_EMBEDDINGS=false` 可以完全关闭向量检索。Anthropic 对话模式也可单独配置 `OPENAI_API_KEY` 使用这项能力。
 
 启用向量检索后，第一次搜索会把尚未缓存的记忆分块以及本次查询发送到 `OPENAI_BASE_URL` 对应的 Embeddings API；之后未变化的文档分块从本地缓存复用。记忆含敏感信息且不希望发送到远端时，请设置 `OPENCLAW_MEMORY_EMBEDDINGS=false`。
 
@@ -268,6 +273,10 @@ export OPENCLAW_COMPACT_SUMMARY_TOKENS="2000"
 ```
 
 token 数是根据原生历史 JSON 的 UTF-8 大小估算，不是模型 tokenizer 的精确计数。压缩切分点只选在真实用户消息之前，不会拆开工具调用和工具结果。
+
+自动压缩和 `/compact` 在摘要生成后、Session 历史真正替换前，会把同一份摘要追加到本地日期对应的 `workspace/memory/YYYY-MM-DD.md`。每段包含内容 Hash 标记，相同摘要不会重复写入；多个 Web Session 并发压缩时通过共享队列串行追加。落盘不会额外调用模型，写入后会调度 FTS5 索引同步。每日记忆不可写、过大或格式异常时会显示失败状态，但不会阻止原有上下文压缩。摘要提示词明确禁止保存 API Key、Token、密码、Cookie 等凭据。
+
+`/memory consolidate` 会读取当前 `MEMORY.md` 和按文件名选择的最近 20 个直属 `memory/*.md`，使用当前对话 Provider 发起一次不带工具、也不写入 Session 历史的整理请求。模型只能返回完整的新 `MEMORY.md` 或 `NO_CHANGES`；宿主会校验 UTF-8、大小和常见凭据模式，再展示完整替换预览。只有明确输入 `y` 或 `yes` 才会原子更新长期记忆，且确认前若 `MEMORY.md` 已被编辑器或其他 Session 修改，会拒绝覆盖并要求重新整理。第一版不会删除、改写或归档任何每日记忆。
 
 ### Shell 工具配置
 
@@ -305,7 +314,8 @@ pnpm dev -- --session smoke
 /history    查看当前 Session 的安全历史视图
 /mcp        查看已连接的 MCP Server 和工具
 /memory     查看长期记忆
-/compact    手动压缩早期会话历史
+/memory consolidate 预览并确认把每日记忆整理到 MEMORY.md
+/compact    保存压缩前记忆并手动压缩早期会话历史
 /clear      清空当前 Session 历史（需要确认）
 /exit       退出
 ```

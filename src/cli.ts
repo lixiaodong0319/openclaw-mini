@@ -34,6 +34,7 @@ import {
   describeWorkspaceMemory,
   loadWorkspaceMemoryContext,
 } from "./workspace-memory.js";
+import { formatMemoryConsolidationPreview } from "./memory-consolidation.js";
 
 async function main(): Promise<void> {
   // CLI 参数目前只解析 --session，保持入口足够小。
@@ -135,7 +136,7 @@ async function executeCliCommand(
     output.write(`[命令] /${command} 需要 Session 名称。\n\n`);
     return undefined;
   }
-  if (!requiresArgument && argument.length > 0) {
+  if (!requiresArgument && command !== "memory" && argument.length > 0) {
     output.write(`[命令] /${command} 不接受参数。\n\n`);
     return undefined;
   }
@@ -242,6 +243,30 @@ Daily memory: ${describeDailyMemories(memory)}\n\n`);
   }
 
   if (command === "memory") {
+    const memoryAction = argument.toLowerCase();
+    if (memoryAction.length > 0 && memoryAction !== "consolidate") {
+      output.write("[命令] /memory 只接受可选参数 consolidate。\n\n");
+      return undefined;
+    }
+    if (memoryAction === "consolidate") {
+      output.write("[记忆] 正在分析近期每日记忆...\n");
+      const plan = await context.runtime.agent.prepareMemoryConsolidation();
+      if (!plan) {
+        output.write("[记忆] 没有需要晋升或整理的长期记忆。\n\n");
+        return undefined;
+      }
+      output.write(`${formatMemoryConsolidationPreview(plan)}\n\n`);
+      const answer = (await context.rl.question(
+        `确认用以上内容替换 ${plan.path}？[y/N] `,
+      )).trim().toLowerCase();
+      if (answer !== "y" && answer !== "yes") {
+        output.write("[记忆] 已取消长期记忆整理。\n\n");
+        return undefined;
+      }
+      const result = await context.runtime.agent.applyMemoryConsolidation(plan);
+      output.write(`[记忆] 已更新 ${result.path}（${result.bytesWritten} bytes），每日记忆保持不变。\n\n`);
+      return undefined;
+    }
     const contextMemory = await loadWorkspaceMemoryContext(context.config.workspaceRoot);
     const blocks: string[] = [];
     const longTerm = contextMemory.longTerm;
@@ -305,6 +330,8 @@ function createSharedAgentRuntime(
   return createAgentRuntime(sessionId, context.config, {
     workspaceInstructions: context.runtime.workspaceInstructions,
     memoryIndex: context.runtime.memoryIndex,
+    memoryFlusher: context.runtime.memoryFlusher,
+    memoryConsolidator: context.runtime.memoryConsolidator,
     mcp: context.runtime.mcp,
   });
 }
@@ -315,7 +342,7 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
   let lineOpen = false;
   let finished = false;
 
-  const writeStatus = (category: "工具" | "会话", message: string): void => {
+  const writeStatus = (category: "工具" | "会话" | "记忆", message: string): void => {
     if (lineOpen) output.write("\n");
     output.write(`[${category}] ${message}\n`);
     lineOpen = false;
@@ -336,6 +363,23 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
       }
       if (event.type === "context_compaction_end") {
         writeStatus("会话", `上下文压缩完成（${event.beforeTokens} → ${event.afterTokens} tokens）`);
+        return;
+      }
+      if (event.type === "memory_flush_start") {
+        writeStatus("记忆", "正在保存压缩前的重要信息...");
+        return;
+      }
+      if (event.type === "memory_flush_end") {
+        writeStatus(
+          "记忆",
+          event.written
+            ? `已写入 ${event.path}（${event.bytesWritten} bytes）`
+            : `${event.path} 已包含相同内容，跳过重复写入`,
+        );
+        return;
+      }
+      if (event.type === "memory_flush_error") {
+        writeStatus("记忆", `保存失败，继续压缩：${event.message}`);
         return;
       }
       if (event.type === "tool_start") {

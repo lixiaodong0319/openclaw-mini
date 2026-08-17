@@ -241,6 +241,13 @@ export const WEB_PAGE = String.raw`<!doctype html>
       if (event.type === "tool_end") return "[工具] " + event.name + (event.isError ? " 失败" : " 完成");
       if (event.type === "context_compaction_start") return "[会话] 正在压缩上下文...";
       if (event.type === "context_compaction_end") return "[会话] 上下文压缩完成";
+      if (event.type === "memory_flush_start") return "[记忆] 正在保存压缩前的重要信息...";
+      if (event.type === "memory_flush_end") {
+        return event.written
+          ? "[记忆] 已写入 " + event.path
+          : "[记忆] 已存在相同内容，跳过重复写入";
+      }
+      if (event.type === "memory_flush_error") return "[记忆] 保存失败，继续压缩：" + event.message;
       return null;
     }
 

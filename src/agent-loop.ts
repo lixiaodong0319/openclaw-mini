@@ -1,4 +1,10 @@
 import { executeTool, requiresToolConfirmation, type ToolContext } from "./tools.js";
+import type { MemoryFlushHandler } from "./memory-flush.js";
+import {
+  type MemoryConsolidationApplyResult,
+  type MemoryConsolidationPlan,
+  WorkspaceMemoryConsolidator,
+} from "./memory-consolidation.js";
 
 export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.`;
 
@@ -32,6 +38,11 @@ export type AgentEvent =
   | { type: "context_compaction_start"; estimatedTokens: number }
   // end 事件只在摘要和历史替换都成功后触发。
   | { type: "context_compaction_end"; beforeTokens: number; afterTokens: number }
+  // Memory Flush 发生在摘要生成后、原生历史替换前。它是压缩生命周期的一部分，
+  // 但写入失败不会阻止后续压缩，所以成功和失败使用独立事件表达。
+  | { type: "memory_flush_start" }
+  | { type: "memory_flush_end"; path: string; written: boolean; bytesWritten: number }
+  | { type: "memory_flush_error"; message: string }
   | { type: "tool_pending"; toolCallId: string; name: string; input: unknown }
   | { type: "tool_approved"; toolCallId: string; name: string }
   | { type: "tool_denied"; toolCallId: string; name: string }
@@ -68,12 +79,18 @@ export interface AgentProvider {
   compactHistoryIfNeeded?(
     onStart?: (estimatedTokens: number) => void,
     force?: boolean,
+    // Provider 在生成有效摘要后、替换历史前调用。AgentLoop 用它把同一份摘要持久化
+    // 到每日记忆；回调由 Provider await，保证不会先丢弃历史再尝试保存。
+    onSummary?: (summary: string) => Promise<void>,
   ): Promise<ContextCompactionResult | undefined>;
   // 清空同样由 Provider 执行，确保内存中的原生历史和持久化 JSONL 一起替换。
   clearHistory?(): Promise<void>;
   addUserText(text: string): Promise<void>;
   generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn>;
   addToolResults(results: ToolExecutionResult[]): Promise<void>;
+  // 记忆整理是独立的无工具请求，不追加到普通 Session 历史。Provider 只负责调用
+  // 当前模型并返回候选文本，文件读取、校验、预览和写入全部留在宿主层。
+  generateMemoryConsolidation?(request: string): Promise<string>;
 }
 
 export interface AgentLoopOptions {
@@ -84,6 +101,8 @@ export interface AgentLoopOptions {
   systemPrompt?: string | (() => string | Promise<string>);
   maxIterations?: number;
   toolExecutor?: ToolExecutor;
+  memoryFlush?: MemoryFlushHandler;
+  memoryConsolidator?: WorkspaceMemoryConsolidator;
 }
 
 export interface TurnResult {
@@ -99,6 +118,8 @@ export class AgentLoop {
   private readonly systemPrompt: string | (() => string | Promise<string>);
   private readonly maxIterations: number;
   private readonly toolExecutor: ToolExecutor;
+  private readonly memoryFlush?: MemoryFlushHandler;
+  private readonly memoryConsolidator?: WorkspaceMemoryConsolidator;
 
   constructor(options: AgentLoopOptions) {
     this.provider = options.provider;
@@ -108,6 +129,8 @@ export class AgentLoop {
     this.maxIterations = options.maxIterations ?? 8;
     // 正常运行使用 executeTool；可注入执行器便于测试“拒绝后绝对不执行”等调度语义。
     this.toolExecutor = options.toolExecutor ?? executeTool;
+    this.memoryFlush = options.memoryFlush;
+    this.memoryConsolidator = options.memoryConsolidator;
   }
 
   async runTurn(
@@ -230,6 +253,26 @@ export class AgentLoop {
     return this.compactContextIfAvailable(onEvent, true);
   }
 
+  async prepareMemoryConsolidation(): Promise<MemoryConsolidationPlan | undefined> {
+    if (!this.memoryConsolidator || !this.provider.generateMemoryConsolidation) {
+      throw new Error("current provider does not support memory consolidation");
+    }
+    // bind 由闭包隐式完成，Provider 方法内部仍可安全访问 client/model 私有字段。
+    return this.memoryConsolidator.prepare((request) => (
+      this.provider.generateMemoryConsolidation?.(request)
+      ?? Promise.reject(new Error("current provider does not support memory consolidation"))
+    ));
+  }
+
+  applyMemoryConsolidation(
+    plan: MemoryConsolidationPlan,
+  ): Promise<MemoryConsolidationApplyResult> {
+    if (!this.memoryConsolidator) {
+      throw new Error("memory consolidation is not configured");
+    }
+    return this.memoryConsolidator.apply(plan);
+  }
+
   // 先让 Provider 持久化空历史，成功后 Provider 才会清空内存。
   // 不支持清空的测试/第三方 Provider 会明确报错，而不是只清掉一侧状态。
   async clearHistory(): Promise<void> {
@@ -245,7 +288,20 @@ export class AgentLoop {
   ): Promise<ContextCompactionResult | undefined> {
     const compaction = await this.provider.compactHistoryIfNeeded?.((estimatedTokens) => {
       onEvent?.({ type: "context_compaction_start", estimatedTokens });
-    }, force);
+    }, force, this.memoryFlush ? async (summary) => {
+      onEvent?.({ type: "memory_flush_start" });
+      try {
+        const result = await this.memoryFlush?.(summary);
+        if (result) onEvent?.({ type: "memory_flush_end", ...result });
+      } catch (error) {
+        // 记忆是压缩前的额外耐久层；磁盘只读、文件过大等错误不应让上下文永远无法
+        // 压缩。事件仍把原因暴露给 CLI/Web，用户可修复后在下一次压缩重试。
+        onEvent?.({
+          type: "memory_flush_error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } : undefined);
 
     if (compaction) {
       // Provider 返回结果意味着新历史已持久化并替换内存，此时才对外宣布完成。

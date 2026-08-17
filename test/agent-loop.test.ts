@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { AgentLoop, type AgentEvent, type ToolExecutor } from "../src/agent-loop.js";
 import type { ContextCompactionOptions } from "../src/context-compaction.js";
+import type { MemoryFlushHandler } from "../src/memory-flush.js";
+import { WorkspaceMemoryConsolidator } from "../src/memory-consolidation.js";
 import { AnthropicProvider, type MessageProvider } from "../src/provider.js";
 import { FakeProvider, message } from "./fake-provider.js";
 
@@ -26,6 +28,8 @@ function createLoop(
     systemPrompt?: string | (() => string | Promise<string>);
     compaction?: Partial<ContextCompactionOptions>;
     onHistoryReplace?: (messages: Anthropic.MessageParam[]) => Promise<void>;
+    memoryFlush?: MemoryFlushHandler;
+    memoryConsolidator?: WorkspaceMemoryConsolidator;
     additionalTools?: Anthropic.Tool[];
   } = {},
 ): AgentLoop {
@@ -43,6 +47,8 @@ function createLoop(
     maxIterations: options.maxIterations,
     toolExecutor: options.toolExecutor,
     systemPrompt: options.systemPrompt,
+    memoryFlush: options.memoryFlush,
+    memoryConsolidator: options.memoryConsolidator,
   });
 }
 
@@ -222,6 +228,89 @@ describe("AgentLoop", () => {
     await loop.clearHistory();
 
     expect(replacements.at(-1)).toEqual([]);
+    expect(messages).toEqual([]);
+  });
+
+  it("flushes the generated summary before replacing Anthropic history", async () => {
+    const messages: Anthropic.MessageParam[] = [
+      { role: "user", content: "old question" },
+      { role: "assistant", content: "old answer" },
+      { role: "user", content: "recent question" },
+      { role: "assistant", content: "recent answer" },
+    ];
+    const client = new FakeProvider([
+      message([textBlock("durable old facts")], "end_turn"),
+    ]);
+    const memoryFlush = vi.fn<MemoryFlushHandler>(async () => ({
+      path: "memory/2026-08-17.md",
+      written: true,
+      bytesWritten: 42,
+    }));
+    const loop = createLoop(client, messages, workspaceRoot, {
+      compaction: { tokenThreshold: 999_999, keepRecentTurns: 1 },
+      memoryFlush,
+    });
+    const events: AgentEvent[] = [];
+
+    await expect(loop.compactContext((event) => events.push(event))).resolves.toBeDefined();
+
+    expect(memoryFlush).toHaveBeenCalledWith("durable old facts");
+    expect(events.map((event) => event.type)).toEqual([
+      "context_compaction_start",
+      "memory_flush_start",
+      "memory_flush_end",
+      "context_compaction_end",
+    ]);
+  });
+
+  it("continues compaction when memory flush fails", async () => {
+    const messages: Anthropic.MessageParam[] = [
+      { role: "user", content: "old question" },
+      { role: "assistant", content: "old answer" },
+      { role: "user", content: "recent question" },
+      { role: "assistant", content: "recent answer" },
+    ];
+    const client = new FakeProvider([
+      message([textBlock("summary still used")], "end_turn"),
+    ]);
+    const loop = createLoop(client, messages, workspaceRoot, {
+      compaction: { tokenThreshold: 999_999, keepRecentTurns: 1 },
+      memoryFlush: async () => {
+        throw new Error("daily memory is read-only");
+      },
+    });
+    const events: AgentEvent[] = [];
+
+    await expect(loop.compactContext((event) => events.push(event))).resolves.toBeDefined();
+
+    expect(events).toContainEqual({
+      type: "memory_flush_error",
+      message: "daily memory is read-only",
+    });
+    expect(messages[0]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "[压缩的早期会话摘要]\nsummary still used" }],
+    });
+  });
+
+  it("generates an Anthropic memory consolidation proposal without changing session history", async () => {
+    await fs.mkdir(path.join(workspaceRoot, "memory"));
+    await fs.writeFile(path.join(workspaceRoot, "memory", "2026-08-17.md"), "durable fact", "utf8");
+    const messages: Anthropic.MessageParam[] = [];
+    const client = new FakeProvider([
+      message([textBlock("# 长期记忆\n\n- durable fact")], "end_turn"),
+    ]);
+    const loop = createLoop(client, messages, workspaceRoot, {
+      memoryConsolidator: new WorkspaceMemoryConsolidator(workspaceRoot),
+    });
+
+    const plan = await loop.prepareMemoryConsolidation();
+
+    expect(plan?.proposedContent).toContain("durable fact");
+    expect(client.calls[0]?.tools).toBeUndefined();
+    expect(client.calls[0]?.system).toEqual([
+      expect.objectContaining({ type: "text", text: expect.stringContaining("NO_CHANGES") }),
+    ]);
     expect(messages).toEqual([]);
   });
 

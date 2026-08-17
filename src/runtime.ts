@@ -21,6 +21,8 @@ import {
 import { migrateLegacyAnthropicSessions, SessionStore } from "./session-store.js";
 import { McpManager } from "./mcp.js";
 import { resolveMemoryEmbeddingEnvironment } from "./embedding.js";
+import { WorkspaceMemoryFlusher } from "./memory-flush.js";
+import { WorkspaceMemoryConsolidator } from "./memory-consolidation.js";
 import {
   MEMORY_INDEX_RELATIVE_PATH,
   WorkspaceMemoryIndex,
@@ -51,12 +53,16 @@ export interface AgentRuntime extends RuntimeConfig {
   workspaceInstructions?: WorkspaceInstructions;
   workspaceMemory: WorkspaceMemoryContext;
   memoryIndex: WorkspaceMemoryIndex;
+  memoryFlusher: WorkspaceMemoryFlusher;
+  memoryConsolidator: WorkspaceMemoryConsolidator;
   mcp: McpManager;
 }
 
 export interface RuntimePreparation {
   workspaceInstructions?: WorkspaceInstructions;
   memoryIndex: WorkspaceMemoryIndex;
+  memoryFlusher: WorkspaceMemoryFlusher;
+  memoryConsolidator: WorkspaceMemoryConsolidator;
   mcp: McpManager;
 }
 
@@ -95,6 +101,8 @@ export async function createAgentRuntime(
       config.model,
       prepared.workspaceInstructions,
       prepared.memoryIndex,
+      prepared.memoryFlusher,
+      prepared.memoryConsolidator,
       prepared.mcp,
     );
   } catch (error) {
@@ -112,6 +120,8 @@ export async function createAgentRuntime(
     agent,
     workspaceInstructions: prepared.workspaceInstructions,
     memoryIndex: prepared.memoryIndex,
+    memoryFlusher: prepared.memoryFlusher,
+    memoryConsolidator: prepared.memoryConsolidator,
     workspaceMemory,
     mcp: prepared.mcp,
   };
@@ -137,10 +147,19 @@ export async function prepareRuntime(config: RuntimeConfig): Promise<RuntimePrep
   // 启动时创建或校验派生索引，让第一次 memory_search 不承担完整初始化延迟。
   // search 自身仍会再次同步，因此用户在进程运行期间手工编辑 Markdown 也不会漏检。
   await memoryIndex.sync();
+  // 所有 Session 共享一个写入队列，Web 并发压缩时不会同时对同一个每日 Markdown
+  // 执行“读取、去重、追加”。它不持有文件句柄，因此无需额外 close 生命周期。
+  const memoryFlusher = new WorkspaceMemoryFlusher(config.workspaceRoot);
+  const memoryConsolidator = new WorkspaceMemoryConsolidator(
+    config.workspaceRoot,
+    () => memoryIndex.scheduleSync(),
+  );
   try {
     return {
       workspaceInstructions: await loadWorkspaceInstructions(config.workspaceRoot),
       memoryIndex,
+      memoryFlusher,
+      memoryConsolidator,
       mcp: await McpManager.load(config.projectRoot),
     };
   } catch (error) {
@@ -157,6 +176,8 @@ async function createAgent(
   model: string,
   workspaceInstructions?: WorkspaceInstructions,
   memoryIndex?: WorkspaceMemoryIndex,
+  memoryFlusher?: WorkspaceMemoryFlusher,
+  memoryConsolidator?: WorkspaceMemoryConsolidator,
   mcp?: McpManager,
 ): Promise<AgentLoop> {
   const compaction = getContextCompactionOptions();
@@ -194,6 +215,14 @@ async function createAgent(
       toolContext,
       toolExecutor,
       systemPrompt,
+      memoryFlush: memoryFlusher ? async (summary) => {
+        const result = await memoryFlusher.flush(summary);
+        // 新记忆仍以 Markdown 为真相源；写入后只调度派生索引同步，失败不会影响已经
+        // 完成的落盘，下一次 memory_search 还会主动执行一次同步。
+        if (result.written) memoryIndex?.scheduleSync();
+        return result;
+      } : undefined,
+      memoryConsolidator,
     });
   }
 
@@ -211,6 +240,12 @@ async function createAgent(
     toolContext,
     toolExecutor,
     systemPrompt,
+    memoryFlush: memoryFlusher ? async (summary) => {
+      const result = await memoryFlusher.flush(summary);
+      if (result.written) memoryIndex?.scheduleSync();
+      return result;
+    } : undefined,
+    memoryConsolidator,
   });
 }
 

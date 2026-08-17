@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { AgentLoop, type AgentEvent } from "../src/agent-loop.js";
 import type { ContextCompactionOptions } from "../src/context-compaction.js";
+import type { MemoryFlushHandler } from "../src/memory-flush.js";
+import { WorkspaceMemoryConsolidator } from "../src/memory-consolidation.js";
 import { OpenAIProvider, type OpenAIInputItem, type OpenAIResponseItem } from "../src/provider.js";
 import { openAIResponse, FakeOpenAIProvider } from "./fake-openai-provider.js";
 
@@ -34,6 +36,8 @@ function createLoop(
     maxIterations?: number;
     compaction?: Partial<ContextCompactionOptions>;
     onHistoryReplace?: (items: OpenAIInputItem[]) => Promise<void>;
+    memoryFlush?: MemoryFlushHandler;
+    memoryConsolidator?: WorkspaceMemoryConsolidator;
     additionalTools?: Array<{
       type: "function";
       name: string;
@@ -55,6 +59,8 @@ function createLoop(
     }),
     toolContext: { workspaceRoot },
     maxIterations: options.maxIterations,
+    memoryFlush: options.memoryFlush,
+    memoryConsolidator: options.memoryConsolidator,
   });
 }
 
@@ -202,6 +208,54 @@ describe("OpenAIProvider adapter", () => {
     await loop.clearHistory();
 
     expect(replacements.at(-1)).toEqual([]);
+    expect(input).toEqual([]);
+  });
+
+  it("passes the OpenAI compaction summary to memory flush", async () => {
+    const input: OpenAIInputItem[] = [
+      { role: "user", content: "old question" },
+      outputMessage("old answer"),
+      { role: "user", content: "recent question" },
+      outputMessage("recent answer"),
+    ];
+    const client = new FakeOpenAIProvider([
+      openAIResponse([outputMessage("OpenAI durable facts")]),
+    ]);
+    const memoryFlush = vi.fn<MemoryFlushHandler>(async () => ({
+      path: "memory/2026-08-17.md",
+      written: true,
+      bytesWritten: 24,
+    }));
+    const loop = createLoop(client, input, workspaceRoot, {
+      compaction: { tokenThreshold: 999_999, keepRecentTurns: 1 },
+      memoryFlush,
+    });
+
+    await expect(loop.compactContext()).resolves.toBeDefined();
+
+    expect(memoryFlush).toHaveBeenCalledWith("OpenAI durable facts");
+    expect(input[0]).toEqual({
+      role: "user",
+      content: "[压缩的早期会话摘要]\nOpenAI durable facts",
+    });
+  });
+
+  it("generates an OpenAI memory consolidation proposal with tools disabled", async () => {
+    await fs.mkdir(path.join(workspaceRoot, "memory"));
+    await fs.writeFile(path.join(workspaceRoot, "memory", "2026-08-17.md"), "stable choice", "utf8");
+    const input: OpenAIInputItem[] = [];
+    const client = new FakeOpenAIProvider([
+      openAIResponse([outputMessage("# 长期记忆\n\n- stable choice")]),
+    ]);
+    const loop = createLoop(client, input, workspaceRoot, {
+      memoryConsolidator: new WorkspaceMemoryConsolidator(workspaceRoot),
+    });
+
+    const plan = await loop.prepareMemoryConsolidation();
+
+    expect(plan?.proposedContent).toContain("stable choice");
+    expect(client.calls[0]?.tools).toEqual([]);
+    expect(client.calls[0]?.instructions).toContain("NO_CHANGES");
     expect(input).toEqual([]);
   });
 
