@@ -1,14 +1,18 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { WorkspaceMemoryIndex } from "../src/memory-index.js";
+import type { EmbeddingClient } from "../src/embedding.js";
+import {
+  WorkspaceMemoryIndex,
+  type WorkspaceMemoryIndexOptions,
+} from "../src/memory-index.js";
 
 const SUPPORTS_NODE_SQLITE = Number(process.versions.node.split(".")[0]) >= 22;
 
 describe.skipIf(!SUPPORTS_NODE_SQLITE)("workspace memory index", () => {
   const temporaryRoots: string[] = [];
 
-  async function createIndex(): Promise<{
+  async function createIndex(options: WorkspaceMemoryIndexOptions = {}): Promise<{
     workspaceRoot: string;
     indexPath: string;
     index: WorkspaceMemoryIndex;
@@ -18,7 +22,11 @@ describe.skipIf(!SUPPORTS_NODE_SQLITE)("workspace memory index", () => {
     const workspaceRoot = path.join(root, "workspace");
     const indexPath = path.join(root, "data", "memory", "index.sqlite");
     await fs.mkdir(workspaceRoot);
-    return { workspaceRoot, indexPath, index: new WorkspaceMemoryIndex(workspaceRoot, indexPath) };
+    return {
+      workspaceRoot,
+      indexPath,
+      index: new WorkspaceMemoryIndex(workspaceRoot, indexPath, options),
+    };
   }
 
   afterEach(async () => {
@@ -75,6 +83,72 @@ describe.skipIf(!SUPPORTS_NODE_SQLITE)("workspace memory index", () => {
     expect(response.results[0]?.snippet).toContain("北京");
   });
 
+  it("combines semantic vectors with keyword search", async () => {
+    const embeddingClient = new FakeEmbeddingClient();
+    const { workspaceRoot, index } = await createIndex({ embeddingClient, vectorWeight: 0.6 });
+    await fs.writeFile(
+      path.join(workspaceRoot, "MEMORY.md"),
+      "# Preferences\n\nThe user prefers TypeScript for application code.\n\n# Weather\n\nRain is expected tomorrow.\n",
+      "utf8",
+    );
+
+    const response = await index.search("which programming language should be used");
+
+    expect(response.searchMode).toBe("hybrid");
+    expect(response.results[0]?.path).toBe("MEMORY.md");
+    expect(response.results[0]?.snippet).toContain("TypeScript");
+  });
+
+  it("persists document vectors and does not embed unchanged chunks again", async () => {
+    const embeddingClient = new FakeEmbeddingClient();
+    const created = await createIndex({ embeddingClient });
+    await fs.writeFile(
+      path.join(created.workspaceRoot, "MEMORY.md"),
+      "The user prefers TypeScript for application code.\n",
+      "utf8",
+    );
+    await created.index.search("which programming language should be used");
+    const documentCallsAfterFirstSearch = embeddingClient.inputs
+      .filter((input) => input.includes("prefers TypeScript")).length;
+
+    // 新实例模拟进程重启；文档向量应从 SQLite 复用，只需生成新的查询向量。
+    const reopened = new WorkspaceMemoryIndex(created.workspaceRoot, created.indexPath, {
+      embeddingClient,
+    });
+    await reopened.search("preferred coding stack");
+
+    expect(documentCallsAfterFirstSearch).toBe(1);
+    expect(embeddingClient.inputs.filter((input) => input.includes("prefers TypeScript")))
+      .toHaveLength(1);
+  });
+
+  it("falls back to BM25 when embedding generation fails", async () => {
+    const embeddingClient: EmbeddingClient = {
+      cacheKey: "always-fails",
+      embed: async () => {
+        throw new Error("temporary embedding outage");
+      },
+    };
+    const { workspaceRoot, index } = await createIndex({ embeddingClient });
+    await fs.writeFile(path.join(workspaceRoot, "MEMORY.md"), "Use TypeScript for new code.\n", "utf8");
+
+    const response = await index.search("TypeScript");
+
+    expect(response.searchMode).toBe("keyword");
+    expect(response.results[0]?.snippet).toContain("TypeScript");
+  });
+
+  it("does not call embeddings when vector weight is zero", async () => {
+    const embeddingClient = new FakeEmbeddingClient();
+    const { workspaceRoot, index } = await createIndex({ embeddingClient, vectorWeight: 0 });
+    await fs.writeFile(path.join(workspaceRoot, "MEMORY.md"), "Use TypeScript.\n", "utf8");
+
+    const response = await index.search("TypeScript");
+
+    expect(response.searchMode).toBe("keyword");
+    expect(embeddingClient.inputs).toHaveLength(0);
+  });
+
   it("rebuilds the derived database after it is deleted", async () => {
     const { workspaceRoot, indexPath, index } = await createIndex();
     await fs.writeFile(path.join(workspaceRoot, "MEMORY.md"), "Remember rebuildable-index.\n", "utf8");
@@ -122,3 +196,24 @@ describe.skipIf(!SUPPORTS_NODE_SQLITE)("workspace memory index", () => {
     await expect(index.sync()).rejects.toThrow("symbolic link");
   });
 });
+
+class FakeEmbeddingClient implements EmbeddingClient {
+  readonly cacheKey = "fake-semantic-v1";
+  readonly inputs: string[] = [];
+
+  async embed(inputs: readonly string[]): Promise<number[][]> {
+    this.inputs.push(...inputs);
+    return inputs.map((input) => {
+      const normalized = input.toLowerCase();
+      if (
+        normalized.includes("typescript")
+        || normalized.includes("programming language")
+        || normalized.includes("coding stack")
+      ) {
+        return [1, 0];
+      }
+      if (normalized.includes("rain") || normalized.includes("weather")) return [0, 1];
+      return [0.1, 0.1];
+    });
+  }
+}

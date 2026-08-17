@@ -303,7 +303,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "memory_search",
-    description: "Search long-term MEMORY.md and every memory/*.md file using the local SQLite FTS5/BM25 index. Call this when relevant durable or older daily context may not be present in the current prompt. This tool is read-only.",
+    description: "Search long-term MEMORY.md and every memory/*.md file using local FTS5/BM25 plus optional semantic Embeddings. Call this when relevant durable or older daily context may not be present in the current prompt. This tool is read-only and falls back to keywords when vectors are unavailable.",
     strict: true,
     input_schema: {
       type: "object",

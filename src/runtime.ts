@@ -20,6 +20,7 @@ import {
 } from "./provider.js";
 import { migrateLegacyAnthropicSessions, SessionStore } from "./session-store.js";
 import { McpManager } from "./mcp.js";
+import { resolveMemoryEmbeddingEnvironment } from "./embedding.js";
 import {
   MEMORY_INDEX_RELATIVE_PATH,
   WorkspaceMemoryIndex,
@@ -122,9 +123,16 @@ export async function prepareRuntime(config: RuntimeConfig): Promise<RuntimePrep
   if (config.providerName === "anthropic") {
     await migrateLegacyAnthropicSessions(config.dataRoot);
   }
+  // 向量检索配置独立于当前对话 Provider：即使聊天使用 Anthropic，只要单独配置了
+  // OPENAI_API_KEY，记忆搜索仍可使用 OpenAI Embeddings；未配置时保持纯本地 BM25。
+  const memoryEmbedding = resolveMemoryEmbeddingEnvironment();
   const memoryIndex = new WorkspaceMemoryIndex(
     config.workspaceRoot,
     path.join(config.dataRoot, MEMORY_INDEX_RELATIVE_PATH),
+    {
+      embeddingClient: memoryEmbedding.client,
+      vectorWeight: memoryEmbedding.vectorWeight,
+    },
   );
   // 启动时创建或校验派生索引，让第一次 memory_search 不承担完整初始化延迟。
   // search 自身仍会再次同步，因此用户在进程运行期间手工编辑 Markdown 也不会漏检。

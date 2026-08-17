@@ -18,7 +18,7 @@
   - `find_files`：按 glob 递归查找 `workspace/` 内的文件路径
   - `search_files`：递归搜索 `workspace/` 内的文本内容
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
-  - `memory_search`：用本地 SQLite FTS5/BM25 索引检索全部 Markdown 记忆
+  - `memory_search`：用 SQLite FTS5/BM25 与可选 Embedding 混合检索全部 Markdown 记忆
   - `memory_get`：从 Markdown 真相源读取精确行范围
   - `git_status`：查看 `workspace/` 内 Git 仓库的分支和文件状态
   - `git_diff`：查看 `workspace/` 内 Git 仓库的暂存或未暂存差异
@@ -53,10 +53,11 @@ src/
   cli-commands.ts    CLI 命令解析、帮助和安全历史格式化
   cli.ts             本地命令行入口
   context-compaction.ts 上下文估算、压缩阈值和保留策略
+  embedding.ts       OpenAI Embeddings HTTP 客户端和向量检索配置
   fetch-url.ts       公网文本请求、DNS 固定和 SSRF 防护
   git-tools.ts       只读 Git 状态、差异和进程安全边界
   mcp.ts             MCP 配置、stdio/HTTP 连接、工具发现与调用适配
-  memory-index.ts    Markdown 记忆分块、SQLite FTS5/BM25 索引与读取
+  memory-index.ts    Markdown 分块、FTS5/BM25 与向量混合检索
   workspace-memory.ts workspace/MEMORY.md 的加载、校验和注入预算
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
@@ -72,6 +73,7 @@ test/
   agent-loop.test.ts     Agent Loop 测试
   apply-patch.test.ts    多文件补丁和安全边界测试
   cli-commands.test.ts   CLI 命令解析和历史格式化测试
+  embedding.test.ts      Embeddings HTTP 请求、批处理和配置测试
   openai-adapter.test.ts OpenAI 适配器测试
   openai-provider.test.ts OpenAI HTTP Provider 测试
   fake-provider.ts       测试用 Fake Provider
@@ -240,7 +242,20 @@ Agent 会自动加载本机日期中今天和昨天的 `YYYY-MM-DD.md` 以及同
 
 AgentLoop 在每次模型调用前重新读取这两层文件，因此手工或工具编辑后无需重启。记忆在 Anthropic/OpenAI 和所有 Session 中共享，不写入 Session JSONL，也不会被会话压缩。磁盘原文不会被截断；`MEMORY.md` 另有 32 KiB 注入预算。
 
-启动时会把 `MEMORY.md` 和所有直属 `memory/*.md` 分块写入 `data/memory/index.sqlite`。`memory_search` 使用 SQLite FTS5 trigram tokenizer 和 BM25 排序，因此可以找到未注入提示词的旧日期记录；不足 3 个字符的短查询会回退为字面量匹配。找到候选后，`memory_get` 直接从 Markdown 原文读取指定行，不把 SQLite 当作真相源。每次搜索前都会用 SHA-256 检查文件变化，文件工具写入后还会触发 250 ms 防抖同步；数据库被删除或 schema 变化时可自动重建。目前尚未实现向量检索和压缩前 memory flush。
+启动时会把 `MEMORY.md` 和所有直属 `memory/*.md` 分块写入 `data/memory/index.sqlite`。`memory_search` 使用 SQLite FTS5 trigram tokenizer 和 BM25 排序，因此可以找到未注入提示词的旧日期记录；不足 3 个字符的短查询会回退为字面量匹配。找到候选后，`memory_get` 直接从 Markdown 原文读取指定行，不把 SQLite 当作真相源。每次搜索前都会用 SHA-256 检查文件变化，文件工具写入后还会触发 250 ms 防抖同步；数据库被删除或 schema 变化时可自动重建。
+
+配置 `OPENAI_API_KEY` 后，`memory_search` 还会按照 [OpenAI 官方 Embeddings 指南](https://developers.openai.com/api/docs/guides/embeddings) 使用 `text-embedding-3-small` 生成文档和查询向量，以余弦相似度补充语义召回，再与 BM25 名次加权合并。文档向量按“分块内容 Hash + 模型配置”缓存在同一个 SQLite 中，未修改的记忆不会重复生成；查询向量在进程内最多缓存 100 条。Embedding 请求失败、响应异常或没有 Key 时自动退回本地 BM25，不影响普通对话和关键词检索。
+
+向量检索配置：
+
+```bash
+export OPENCLAW_EMBEDDING_MODEL="text-embedding-3-small"
+export OPENCLAW_MEMORY_VECTOR_WEIGHT="0.5"
+```
+
+`OPENCLAW_MEMORY_VECTOR_WEIGHT` 范围为 0–1，`0` 表示只用关键词。可选的 `OPENCLAW_EMBEDDING_DIMENSIONS` 会传给支持缩短向量的第三代 Embedding 模型；`OPENCLAW_MEMORY_EMBEDDINGS=false` 可以完全关闭向量检索。Anthropic 对话模式也可单独配置 `OPENAI_API_KEY` 使用这项能力。目前尚未实现压缩前 memory flush。
+
+启用向量检索后，第一次搜索会把尚未缓存的记忆分块以及本次查询发送到 `OPENAI_BASE_URL` 对应的 Embeddings API；之后未变化的文档分块从本地缓存复用。记忆含敏感信息且不希望发送到远端时，请设置 `OPENCLAW_MEMORY_EMBEDDINGS=false`。
 
 ### 上下文压缩配置
 
@@ -493,7 +508,7 @@ pnpm run build
 - Web 配置与 Session 接口、SSE 文本流和浏览器工具确认
 - Anthropic/OpenAI 会话历史统一展示与内部数据过滤
 - Anthropic 和 OpenAI 历史摘要压缩与最近工具链保留
-- Markdown 记忆的 SQLite FTS5/BM25 派生索引、变更同步、旧记录检索和按行读取
+- Markdown 记忆的 SQLite FTS5/BM25 + Embedding 混合检索、向量缓存、失败降级和按行读取
 - CLI 命令解析、安全历史展示、阈值外手动压缩和原子清空
 - 压缩后 JSONL 历史原子替换
 - 旧 Anthropic 会话向独立目录的无覆盖迁移

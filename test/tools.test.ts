@@ -612,6 +612,7 @@ describe("tools", () => {
         results: [],
         indexedFiles: 1,
         indexedChunks: 1,
+        searchMode: "keyword" as const,
       })),
       get: vi.fn(async () => ({
         path: "MEMORY.md",
