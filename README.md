@@ -12,14 +12,16 @@
 - OpenAI 默认模型为 `gpt-5.3-codex`
 - 启动时读取 `workspace/AGENTS.md`，作为 CLI 与 Web 共用的工作区指令
 - 扫描 `workspace/skills/*/SKILL.md`，按需加载可热刷新的任务技能
+- 为复杂任务维护按 Provider/Session 隔离、重启可恢复的任务计划
 - 从项目根目录的 `mcp.json` 连接 stdio 或 Streamable HTTP MCP Server，并动态加载工具
-- 十六个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
+- 十七个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
   - `find_files`：按 glob 递归查找 `workspace/` 内的文件路径
   - `search_files`：递归搜索 `workspace/` 内的文本内容
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
   - `read_skill`：按名称读取已启用 Skill 的完整工作流指令
+  - `update_plan`：创建或更新当前 Session 的多步骤任务计划
   - `memory_search`：用 SQLite FTS5/BM25 与可选 Embedding 混合检索全部 Markdown 记忆
   - `memory_get`：从 Markdown 真相源读取精确行范围
   - `git_status`：查看 `workspace/` 内 Git 仓库的分支和文件状态
@@ -64,6 +66,7 @@ src/
   memory-flush.ts    压缩摘要的每日记忆落盘、去重和并发写入
   memory-consolidation.ts 每日记忆到 MEMORY.md 的提案、校验和确认写入
   skills.ts          workspace Skills 扫描、校验和按需读取
+  task-plan.ts       Session 任务计划持久化、校验和格式化
   workspace-memory.ts workspace/MEMORY.md 的加载、校验和注入预算
   provider.ts        Anthropic 与 OpenAI Provider 适配器
   runtime.ts         CLI 与 Web 共用的 Provider、模型和 Agent 组装逻辑
@@ -90,6 +93,7 @@ test/
   memory-flush.test.ts   压缩前记忆落盘、去重和安全边界测试
   memory-consolidation.test.ts 长期记忆整理、并发保护和凭据拦截测试
   skills.test.ts        Skills 发现、热刷新和安全边界测试
+  task-plan.test.ts     任务计划持久化、并发和安全边界测试
   workspace-memory.test.ts MEMORY.md 加载、UTF-8 边界和截断测试
   session-store.test.ts  会话存储测试
   session-history.test.ts 会话历史展示转换测试
@@ -247,6 +251,24 @@ enabled: true
 
 启动时以及每次模型请求前都会重新扫描技能目录，因此新增、修改、启用或禁用 Skill 后无需重启。系统提示词只注入启用技能的 `name` 和 `description`；模型判断任务匹配后，会调用只读且自动放行的 `read_skill` 获取完整正文。Skill 是用户管理的工作流指令，不能覆盖系统安全边界，也不能绕过写文件、网络、Shell 或 MCP 工具的确认机制。CLI 输入 `/skills` 可以查看当前发现的启用和禁用技能。
 
+### 任务计划
+
+当需求包含多个明确步骤时，Agent 可以调用自动放行的 `update_plan` 创建并持续更新计划：
+
+```json
+{
+  "steps": [
+    { "content": "分析现有代码", "status": "completed" },
+    { "content": "实现任务计划", "status": "in_progress" },
+    { "content": "运行测试", "status": "pending" }
+  ]
+}
+```
+
+状态只能是 `pending`、`in_progress` 或 `completed`，同一计划最多包含一个 `in_progress`，最多 20 个步骤。简单的一步请求不会强制创建计划。每次模型调用前，当前计划都会重新注入系统上下文，因此工具调用后的下一次模型请求以及进程重启后都能继续看到最新进度。
+
+计划独立保存到 `data/plans/<provider>/<session>.json`，不会混入 Anthropic/OpenAI 的原生 Session JSONL。重命名或删除 Session 时，对应计划会一起移动或清理。CLI 使用 `/plan` 查看、`/plan clear` 清除；Web 页面可以查看和清除计划，并通过 SSE 实时展示模型更新后的步骤。`update_plan` 只允许写宿主管理的计划状态，不能指定任意文件路径；其他写文件、Shell、网络和 MCP 工具仍遵守原有确认机制。
+
 ### 长期记忆
 
 长期记忆使用 OpenClaw 风格的 Markdown 真相源：`workspace/MEMORY.md`。可以直接编辑：
@@ -340,6 +362,8 @@ pnpm dev -- --session smoke
 /history    查看当前 Session 的安全历史视图
 /mcp        查看已连接的 MCP Server 和工具
 /skills     查看已发现的 workspace Skills
+/plan       查看当前 Session 的任务计划
+/plan clear 清除当前 Session 的任务计划
 /memory     查看长期记忆
 /memory consolidate 预览并确认把每日记忆整理到 MEMORY.md
 /compact    保存压缩前记忆并手动压缩早期会话历史
@@ -491,7 +515,7 @@ pnpm test         运行测试
 
 ## 安全边界
 
-当前版本暴露十个自动放行工具，以及六个每次都需确认的目录创建、文件修改、网络和 Shell 工具。OpenAI 模式还启用由 Responses API 托管的原生 Web Search。模型无法控制浏览器；文件工具无法读写 workspace 外文件。
+当前版本暴露十个只读或纯计算工具、一个自动放行的受控计划更新工具，以及六个每次都需确认的目录创建、文件修改、网络和 Shell 工具。OpenAI 模式还启用由 Responses API 托管的原生 Web Search。模型无法控制浏览器；文件工具无法读写 workspace 外文件。
 
 工具权限采用安全默认值：已登记的纯计算和只读工具自动放行，所有未登记工具都必须经过用户确认。拒绝后不会调用工具实现，而是把拒绝结果回填给模型，让模型继续回复。
 

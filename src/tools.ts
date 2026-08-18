@@ -17,6 +17,12 @@ import {
   type MemoryToolService,
 } from "./memory-index.js";
 import type { SkillToolService } from "./skills.js";
+import {
+  MAX_TASK_PLAN_STEPS,
+  MAX_TASK_PLAN_STEP_BYTES,
+  type TaskPlanStep,
+  type TaskPlanToolService,
+} from "./task-plan.js";
 
 // 直接复用 SDK 的 Tool 类型，确保工具定义形状和 Anthropic SDK 保持一致。
 // 不额外声明自定义 Tool interface，可以避免 SDK 升级后字段含义或类型漂移。
@@ -43,6 +49,9 @@ export interface ToolContext {
   // Skill Manager 与记忆索引一样由 Runtime 可信注入。read_skill 只接受技能名，
   // 具体目录、文件名和启用状态都由服务端重新扫描、校验，模型不能传入任意路径。
   skills?: SkillToolService;
+  // 任务计划同样由当前 Session 的 Store 注入。模型只提交步骤，不能指定其他
+  // Session、Provider namespace 或 data 路径。
+  taskPlan?: TaskPlanToolService;
 }
 
 // read_text_file 的模型输入结构。
@@ -115,6 +124,10 @@ interface ReadSkillInput {
   name: string;
 }
 
+interface UpdatePlanInput {
+  steps: TaskPlanStep[];
+}
+
 interface GitStatusInput {
   path: string;
 }
@@ -175,7 +188,9 @@ const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 // 这不是 Shell 沙箱，而是防止 `env` 等普通命令直接暴露 API Key 的额外防线。
 const SENSITIVE_ENVIRONMENT_NAME = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|AUTHORIZATION|COOKIE|SESSION|JWT)(?:_|$)/i;
 
-// 当前十个工具都是只读或纯计算能力，可以直接执行。
+// 当前十个只读/纯计算工具和一个受控的 Session 计划更新工具可以直接执行。
+// update_plan 只写宿主管理的计划 JSON，不能读写任意路径；若为它逐次确认，会让
+// 模型在复杂任务的每一步都打断用户，因此将它作为低风险状态更新自动放行。
 // 未登记的新工具默认需要用户确认，避免未来加入写文件、Shell 等能力时意外绕过审批。
 const AUTO_APPROVED_TOOLS = new Set([
   "calculator",
@@ -184,6 +199,7 @@ const AUTO_APPROVED_TOOLS = new Set([
   "search_files",
   "read_text_file",
   "read_skill",
+  "update_plan",
   "memory_search",
   "memory_get",
   "git_status",
@@ -323,6 +339,40 @@ export const toolDefinitions: ToolDefinition[] = [
         },
       },
       required: ["name"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "update_plan",
+    description: "Create or replace the current Session's task plan for a non-trivial multi-step task. Keep steps concise, update statuses as work progresses, and use at most one in_progress step. Do not use this for simple one-step requests. This only changes host-managed plan metadata and is auto-approved.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        steps: {
+          type: "array",
+          minItems: 1,
+          maxItems: MAX_TASK_PLAN_STEPS,
+          items: {
+            type: "object",
+            properties: {
+              content: {
+                type: "string",
+                minLength: 1,
+                maxLength: MAX_TASK_PLAN_STEP_BYTES,
+                description: "One concise task step.",
+              },
+              status: {
+                type: "string",
+                enum: ["pending", "in_progress", "completed"],
+              },
+            },
+            required: ["content", "status"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["steps"],
       additionalProperties: false,
     },
   },
@@ -572,6 +622,10 @@ export async function executeTool(
       return readTextFile(parseReadTextFileInput(input), context);
     case "read_skill":
       return requireSkillService(context).readSkill(parseReadSkillInput(input).name);
+    case "update_plan": {
+      const plan = await requireTaskPlanService(context).updatePlan(parseUpdatePlanInput(input).steps);
+      return JSON.stringify(plan, null, 2);
+    }
     case "memory_search": {
       const parsed = parseMemorySearchInput(input);
       const result = await requireMemoryIndex(context).search(parsed.query, parsed.maxResults);
@@ -715,6 +769,40 @@ function requireSkillService(context: ToolContext): SkillToolService {
     throw new Error("skill manager is not configured");
   }
   return context.skills;
+}
+
+function parseUpdatePlanInput(input: unknown): UpdatePlanInput {
+  if (!isRecord(input) || !Array.isArray(input.steps)) {
+    throw new Error("update_plan requires a steps array");
+  }
+  if (input.steps.length < 1 || input.steps.length > MAX_TASK_PLAN_STEPS) {
+    throw new Error(`update_plan requires between 1 and ${MAX_TASK_PLAN_STEPS} steps`);
+  }
+  let inProgress = 0;
+  const steps = input.steps.map((value, index): TaskPlanStep => {
+    if (!isRecord(value) || typeof value.content !== "string") {
+      throw new Error(`update_plan step ${index + 1} requires string content`);
+    }
+    const content = value.content.trim();
+    if (content.length === 0) throw new Error(`update_plan step ${index + 1} must not be empty`);
+    if (Buffer.byteLength(content, "utf8") > MAX_TASK_PLAN_STEP_BYTES) {
+      throw new Error(
+        `update_plan step ${index + 1} is too large; maximum is ${MAX_TASK_PLAN_STEP_BYTES} bytes`,
+      );
+    }
+    if (value.status !== "pending" && value.status !== "in_progress" && value.status !== "completed") {
+      throw new Error(`update_plan step ${index + 1} has an invalid status`);
+    }
+    if (value.status === "in_progress") inProgress += 1;
+    return { content, status: value.status };
+  });
+  if (inProgress > 1) throw new Error("update_plan allows at most one in_progress step");
+  return { steps };
+}
+
+function requireTaskPlanService(context: ToolContext): TaskPlanToolService {
+  if (!context.taskPlan) throw new Error("task plan store is not configured");
+  return context.taskPlan;
 }
 
 function parseMemorySearchInput(input: unknown): MemorySearchInput {

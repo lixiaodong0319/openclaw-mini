@@ -6,6 +6,7 @@ import { AgentLoop, type AgentEvent, type ToolExecutor } from "../src/agent-loop
 import type { ContextCompactionOptions } from "../src/context-compaction.js";
 import type { MemoryFlushHandler } from "../src/memory-flush.js";
 import { WorkspaceMemoryConsolidator } from "../src/memory-consolidation.js";
+import type { TaskPlan, TaskPlanToolService } from "../src/task-plan.js";
 import { AnthropicProvider, type MessageProvider } from "../src/provider.js";
 import { FakeProvider, message } from "./fake-provider.js";
 
@@ -31,6 +32,7 @@ function createLoop(
     memoryFlush?: MemoryFlushHandler;
     memoryConsolidator?: WorkspaceMemoryConsolidator;
     additionalTools?: Anthropic.Tool[];
+    taskPlan?: TaskPlanToolService;
   } = {},
 ): AgentLoop {
   return new AgentLoop({
@@ -43,7 +45,7 @@ function createLoop(
       compaction: options.compaction,
       additionalTools: options.additionalTools,
     }),
-    toolContext: { workspaceRoot },
+    toolContext: { workspaceRoot, taskPlan: options.taskPlan },
     maxIterations: options.maxIterations,
     toolExecutor: options.toolExecutor,
     systemPrompt: options.systemPrompt,
@@ -343,6 +345,44 @@ describe("AgentLoop", () => {
       type: "tool_end",
       toolCallId: "toolu_1",
       name: "calculator",
+      isError: false,
+    });
+  });
+
+  it("updates a Session plan without confirmation and emits the final plan", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_plan", "update_plan", {
+        steps: [
+          { content: "分析代码", status: "completed" },
+          { content: "实现功能", status: "in_progress" },
+        ],
+      })], "tool_use"),
+      message([textBlock("继续实现")], "end_turn"),
+    ]);
+    let currentPlan: TaskPlan | undefined;
+    const taskPlan: TaskPlanToolService = {
+      updatePlan: vi.fn(async (steps) => {
+        currentPlan = {
+          version: 1,
+          updatedAt: "2026-08-17T00:00:00.000Z",
+          steps: [...steps],
+        };
+        return currentPlan;
+      }),
+      loadPlan: vi.fn(async () => currentPlan),
+    };
+    const loop = createLoop(provider, [], workspaceRoot, { taskPlan });
+    const events: AgentEvent[] = [];
+    const confirm = vi.fn(async () => false);
+
+    await loop.runTurn("实现复杂功能", (event) => events.push(event), confirm);
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(events).toContainEqual({ type: "plan_updated", plan: currentPlan });
+    expect(events).toContainEqual({
+      type: "tool_end",
+      toolCallId: "toolu_plan",
+      name: "update_plan",
       isError: false,
     });
   });

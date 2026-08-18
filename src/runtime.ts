@@ -24,6 +24,7 @@ import { resolveMemoryEmbeddingEnvironment } from "./embedding.js";
 import { WorkspaceMemoryFlusher } from "./memory-flush.js";
 import { WorkspaceMemoryConsolidator } from "./memory-consolidation.js";
 import { WorkspaceSkillManager } from "./skills.js";
+import { TaskPlanStore } from "./task-plan.js";
 import {
   MEMORY_INDEX_RELATIVE_PATH,
   WorkspaceMemoryIndex,
@@ -57,6 +58,7 @@ export interface AgentRuntime extends RuntimeConfig {
   memoryFlusher: WorkspaceMemoryFlusher;
   memoryConsolidator: WorkspaceMemoryConsolidator;
   skillManager: WorkspaceSkillManager;
+  taskPlan: TaskPlanStore;
   mcp: McpManager;
 }
 
@@ -90,9 +92,15 @@ export async function createAgentRuntime(
   // CLI 切换会话、修改记忆以及 Web 创建多个 Agent 时会复用它。
   const ownsPreparation = preparation === undefined;
   const prepared = preparation ?? await prepareRuntime(config);
+  // 计划属于当前 Provider/Session，不放进共享 preparation。切换 Session 时会创建
+  // 新 Store，并从对应 JSON 恢复；记忆、Skills 和 MCP 仍按原方式共享。
+  const taskPlan = new TaskPlanStore(config.dataRoot, sessionId, config.providerName);
   let workspaceMemory: WorkspaceMemoryContext;
   let agent: AgentLoop;
   try {
+    // 已存在的计划在 Agent 构建前先校验一次，损坏或被替换为符号链接时启动即报错，
+    // 而不是等到第一次模型请求才发现。
+    await taskPlan.loadPlan();
     // 启动时先读一次用于校验和状态展示。AgentLoop 运行时仍会在每次
     // 模型调用前重读 MEMORY.md，因此手工或工具编辑后不需重建 Agent。
     workspaceMemory = await loadWorkspaceMemoryContext(config.workspaceRoot);
@@ -107,6 +115,7 @@ export async function createAgentRuntime(
       prepared.memoryFlusher,
       prepared.memoryConsolidator,
       prepared.skillManager,
+      taskPlan,
       prepared.mcp,
     );
   } catch (error) {
@@ -127,6 +136,7 @@ export async function createAgentRuntime(
     memoryFlusher: prepared.memoryFlusher,
     memoryConsolidator: prepared.memoryConsolidator,
     skillManager: prepared.skillManager,
+    taskPlan,
     workspaceMemory,
     mcp: prepared.mcp,
   };
@@ -189,6 +199,7 @@ async function createAgent(
   memoryFlusher?: WorkspaceMemoryFlusher,
   memoryConsolidator?: WorkspaceMemoryConsolidator,
   skillManager?: WorkspaceSkillManager,
+  taskPlan?: TaskPlanStore,
   mcp?: McpManager,
 ): Promise<AgentLoop> {
   const compaction = getContextCompactionOptions();
@@ -199,6 +210,7 @@ async function createAgent(
     workspaceInstructions,
     await loadWorkspaceMemoryContext(workspaceRoot),
     await skillManager?.loadCatalog() ?? [],
+    await taskPlan?.loadPlan(),
   );
   const mcpDefinitions = mcp?.getDefinitions();
   const toolContext: ToolContext = {
@@ -206,6 +218,7 @@ async function createAgent(
     commandTimeoutMs: getCommandTimeoutMs(),
     memoryIndex,
     skills: skillManager,
+    taskPlan,
   };
   const toolExecutor: ToolExecutor = async (name, input, context) => {
     if (mcp?.hasTool(name)) return mcp.execute(name, input);

@@ -11,6 +11,7 @@ import {
   sessionExists,
   SessionStore,
 } from "../src/session-store.js";
+import { TaskPlanStore } from "../src/task-plan.js";
 
 describe("SessionStore", () => {
   it("appends and reloads messages", async () => {
@@ -80,6 +81,9 @@ describe("SessionStore", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-store-"));
 
     await createSession(root, "first", "openai");
+    await new TaskPlanStore(root, "first", "openai").updatePlan([
+      { content: "keep progress", status: "in_progress" },
+    ]);
     await expect(sessionExists(root, "first", "openai")).resolves.toBe(true);
     await expect(listSessionIds(root, "openai")).resolves.toEqual(["first"]);
     await expect(createSession(root, "first", "openai")).rejects.toThrow("already exists");
@@ -88,9 +92,14 @@ describe("SessionStore", () => {
     await expect(sessionExists(root, "first", "openai")).resolves.toBe(false);
     await expect(sessionExists(root, "renamed", "openai")).resolves.toBe(true);
     await expect(listSessionIds(root, "openai")).resolves.toEqual(["renamed"]);
+    await expect(new TaskPlanStore(root, "first", "openai").loadPlan()).resolves.toBeUndefined();
+    await expect(new TaskPlanStore(root, "renamed", "openai").loadPlan())
+      .resolves.toMatchObject({ steps: [{ content: "keep progress", status: "in_progress" }] });
 
     await deleteSession(root, "renamed", "openai");
     await expect(listSessionIds(root, "openai")).resolves.toEqual([]);
+    await expect(new TaskPlanStore(root, "renamed", "openai").loadPlan())
+      .resolves.toBeUndefined();
     await expect(deleteSession(root, "renamed", "openai")).rejects.toThrow("not found");
   });
 

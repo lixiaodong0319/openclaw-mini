@@ -20,6 +20,7 @@ import {
   describeWorkspaceMemory,
   loadWorkspaceMemoryContext,
 } from "./workspace-memory.js";
+import { TaskPlanStore } from "./task-plan.js";
 
 async function main(): Promise<void> {
   const config = resolveRuntimeConfig();
@@ -67,6 +68,16 @@ async function main(): Promise<void> {
     },
     loadHistory: (sessionId) => loadSessionHistory(config, sessionId),
     loadMemory: () => loadWorkspaceMemoryContext(config.workspaceRoot),
+    loadPlan: (sessionId) => new TaskPlanStore(
+      config.dataRoot,
+      sessionId,
+      config.providerName,
+    ).loadPlan(),
+    clearPlan: (sessionId) => new TaskPlanStore(
+      config.dataRoot,
+      sessionId,
+      config.providerName,
+    ).clearPlan(),
   });
   server.once("close", () => {
     preparation.memoryIndex.close();

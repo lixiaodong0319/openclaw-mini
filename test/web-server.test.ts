@@ -2,6 +2,7 @@ import type { AddressInfo } from "node:net";
 import type { AgentLoop, ToolConfirmationRequest } from "../src/agent-loop.js";
 import type { RuntimeConfig } from "../src/runtime.js";
 import type { WorkspaceMemoryContext } from "../src/workspace-memory.js";
+import type { TaskPlan } from "../src/task-plan.js";
 import { WEB_PAGE } from "../src/web-page.js";
 import { createWebServer } from "../src/web-server.js";
 
@@ -79,6 +80,8 @@ function sessionManagementOptions() {
       discoveredDailyFiles: 0,
       dailyTruncated: false,
     })),
+    loadPlan: vi.fn(async (): Promise<TaskPlan | undefined> => undefined),
+    clearPlan: vi.fn(async () => false),
   };
 }
 
@@ -230,6 +233,34 @@ describe("Web server", () => {
       body: JSON.stringify({ text: "Prefer TypeScript" }),
     });
     expect(unsupportedWrite.status).toBe(404);
+  });
+
+  it("reads and clears the selected Session task plan", async () => {
+    const management = sessionManagementOptions();
+    const plan: TaskPlan = {
+      version: 1,
+      updatedAt: "2026-08-17T00:00:00.000Z",
+      steps: [{ content: "实现功能", status: "in_progress" }],
+    };
+    management.loadPlan.mockResolvedValue(plan);
+    management.clearPlan.mockResolvedValue(true);
+    const server = createWebServer({
+      config,
+      ...management,
+      getAgent: async () => createRunner(async () => ({ text: "", stopReason: "done" })),
+      listSessions: async () => ["demo"],
+      loadHistory: emptyHistory,
+    });
+    servers.push(server);
+    const baseUrl = await listen(server);
+
+    await expect(fetch(`${baseUrl}/api/sessions/demo/plan`).then((response) => response.json()))
+      .resolves.toEqual({ plan });
+    expect(management.loadPlan).toHaveBeenCalledWith("demo");
+
+    const response = await fetch(`${baseUrl}/api/sessions/demo/plan`, { method: "DELETE" });
+    expect(response.status).toBe(204);
+    expect(management.clearPlan).toHaveBeenCalledWith("demo");
   });
 
   it("streams agent text and completion as SSE", async () => {

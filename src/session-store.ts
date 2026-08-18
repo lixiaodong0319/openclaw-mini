@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { constants as fsConstants, type Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { deleteTaskPlan, renameTaskPlan } from "./task-plan.js";
 
 // 简单的泛型 JSONL 会话存储。
 // 平时逐条追加；只有上下文压缩后才原子替换整个历史文件。
@@ -147,9 +148,18 @@ export async function renameSession(
     }
     throw error;
   }
+  let planRenamed = false;
   try {
+    // 先保留新历史硬链接，再移动可选的计划文件。计划移动失败时删除新历史链接，
+    // 旧 Session 仍然完整；历史源删除失败时也把计划移回旧名称。
+    if (namespace) {
+      planRenamed = await renameTaskPlan(dataRoot, oldSessionId, newSessionId, namespace);
+    }
     await fs.unlink(source);
   } catch (error) {
+    if (namespace && planRenamed) {
+      await renameTaskPlan(dataRoot, newSessionId, oldSessionId, namespace).catch(() => undefined);
+    }
     // 删除旧名称失败时撤销新链接，恢复到调用前状态。
     await fs.unlink(target).catch(() => undefined);
     throw error;
@@ -164,6 +174,8 @@ export async function deleteSession(
   const filePath = getSessionFilePath(dataRoot, sessionId, namespace);
   await requireRegularSessionFile(filePath, sessionId);
   await fs.unlink(filePath);
+  // 计划是 Session 的附属状态；删除会话后同步清理。没有计划时 deleteTaskPlan 返回 false。
+  if (namespace) await deleteTaskPlan(dataRoot, sessionId, namespace);
 }
 
 // 早期版本把 Anthropic 会话直接写在 data/sessions/*.jsonl。

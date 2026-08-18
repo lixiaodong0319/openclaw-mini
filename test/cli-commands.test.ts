@@ -28,6 +28,7 @@ describe("CLI commands", () => {
       "history",
       "mcp",
       "skills",
+      "plan",
       "memory",
       "compact",
       "clear",

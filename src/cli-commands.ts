@@ -13,6 +13,8 @@ export const CLI_HELP_TEXT = `内置命令:
   /history          查看当前 Session 的安全历史视图
   /mcp              查看已连接的 MCP Server 和工具
   /skills           查看已发现的 workspace Skills
+  /plan             查看当前 Session 的任务计划
+  /plan clear       清除当前 Session 的任务计划
   /memory           查看长期记忆
   /memory consolidate 预览并确认把每日记忆整理到 MEMORY.md
   /compact          保存压缩前记忆并手动压缩早期会话历史
@@ -30,6 +32,7 @@ export type CliCommandName =
   | "history"
   | "mcp"
   | "skills"
+  | "plan"
   | "memory"
   | "compact"
   | "clear"
@@ -51,6 +54,7 @@ const CLI_COMMAND_NAMES = new Set<CliCommandName>([
   "history",
   "mcp",
   "skills",
+  "plan",
   "memory",
   "compact",
   "clear",

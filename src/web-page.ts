@@ -19,6 +19,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
 
   <p>
     <button id="show-memory" type="button">查看记忆</button>
+    <button id="show-plan" type="button">查看计划</button>
+    <button id="clear-plan" type="button">清除计划</button>
   </p>
 
   <hr>
@@ -41,6 +43,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
     const renameSessionElement = document.querySelector("#rename-session");
     const deleteSessionElement = document.querySelector("#delete-session");
     const showMemoryElement = document.querySelector("#show-memory");
+    const showPlanElement = document.querySelector("#show-plan");
+    const clearPlanElement = document.querySelector("#clear-plan");
     let assistantOutput = null;
     let historyLoadVersion = 0;
 
@@ -225,10 +229,40 @@ export const WEB_PAGE = String.raw`<!doctype html>
       appendMessage("长期记忆", text);
     }
 
+    function formatTaskPlan(plan) {
+      if (!plan) return "[Plan] 当前 Session 暂无任务计划。";
+      const completed = plan.steps.filter((step) => step.status === "completed").length;
+      const lines = ["[Plan] " + completed + "/" + plan.steps.length + " completed"];
+      plan.steps.forEach((step) => {
+        const marker = step.status === "completed" ? "✓" : step.status === "in_progress" ? "→" : " ";
+        lines.push("  [" + marker + "] " + step.content);
+      });
+      return lines.join("\n");
+    }
+
+    async function showCurrentPlan() {
+      const sessionId = sessionElement.value;
+      const response = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/plan");
+      if (!response.ok) throw new Error("无法读取任务计划");
+      appendMessage("任务计划", formatTaskPlan((await response.json()).plan));
+    }
+
+    async function clearCurrentPlan() {
+      const sessionId = sessionElement.value;
+      if (!confirm("确认清除 Session " + sessionId + " 的任务计划？")) return;
+      const response = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/plan", {
+        method: "DELETE",
+      });
+      if (!response.ok) throw new Error("无法清除任务计划");
+      appendMessage("任务计划", "[Plan] 当前任务计划已清除。");
+    }
+
     newSessionElement.addEventListener("click", () => createNewSession().catch(showError));
     renameSessionElement.addEventListener("click", () => renameCurrentSession().catch(showError));
     deleteSessionElement.addEventListener("click", () => deleteCurrentSession().catch(showError));
     showMemoryElement.addEventListener("click", () => showMemories().catch(showError));
+    showPlanElement.addEventListener("click", () => showCurrentPlan().catch(showError));
+    clearPlanElement.addEventListener("click", () => clearCurrentPlan().catch(showError));
 
     sessionElement.addEventListener("change", () => {
       loadHistory(sessionElement.value).catch(showError);
@@ -278,6 +312,9 @@ export const WEB_PAGE = String.raw`<!doctype html>
     function handlePayload(payload, sessionId) {
       if (payload.type === "agent_event") {
         if (payload.event.type === "text_delta") appendAssistantText(payload.event.text);
+        if (payload.event.type === "plan_updated") {
+          appendMessage("任务计划", formatTaskPlan(payload.event.plan));
+        }
         const description = describeAgentEvent(payload.event);
         if (description) appendMessage("状态", description);
         return;
@@ -343,6 +380,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
       renameSessionElement.disabled = true;
       deleteSessionElement.disabled = true;
       showMemoryElement.disabled = true;
+      showPlanElement.disabled = true;
+      clearPlanElement.disabled = true;
       try {
         await streamChat(sessionId, message);
       } catch (error) {
@@ -354,6 +393,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
         renameSessionElement.disabled = false;
         deleteSessionElement.disabled = false;
         showMemoryElement.disabled = false;
+        showPlanElement.disabled = false;
+        clearPlanElement.disabled = false;
         messageElement.focus();
       }
     });

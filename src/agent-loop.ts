@@ -5,6 +5,7 @@ import {
   type MemoryConsolidationPlan,
   WorkspaceMemoryConsolidator,
 } from "./memory-consolidation.js";
+import type { TaskPlan } from "./task-plan.js";
 
 export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.`;
 
@@ -47,7 +48,9 @@ export type AgentEvent =
   | { type: "tool_approved"; toolCallId: string; name: string }
   | { type: "tool_denied"; toolCallId: string; name: string }
   | { type: "tool_start"; toolCallId: string; name: string }
-  | { type: "tool_end"; toolCallId: string; name: string; isError: boolean };
+  | { type: "tool_end"; toolCallId: string; name: string; isError: boolean }
+  // update_plan 可能和同一批其他工具并行执行；全部完成后只广播最终落盘版本。
+  | { type: "plan_updated"; plan: TaskPlan };
 
 export type AgentEventHandler = (event: AgentEvent) => void;
 export type TextDeltaHandler = (text: string) => void;
@@ -234,6 +237,16 @@ export class AgentLoop {
           return result;
         }),
       );
+
+      const planWasUpdated = results.some((result, index) => (
+        !result.isError && decisions[index]?.call.name === "update_plan"
+      ));
+      if (planWasUpdated && this.toolContext.taskPlan) {
+        // 不根据模型参数或工具返回字符串拼装 UI 状态，而是读取 Store 最终落盘值。
+        // 同一模型响应即使错误地发出多个 update_plan，也只展示队列执行后的最终计划。
+        const plan = await this.toolContext.taskPlan.loadPlan();
+        if (plan) onEvent?.({ type: "plan_updated", plan });
+      }
 
       // 工具结果回填后不立即返回用户，而是进入下一次模型迭代。
       // 模型可以基于结果组织最终答案，或者发起下一组工具调用。

@@ -10,6 +10,7 @@ import { formatRuntimeError } from "./runtime.js";
 import type { SessionHistoryView } from "./session-history.js";
 import type { WorkspaceInstructions } from "./workspace-instructions.js";
 import type { WorkspaceMemoryContext } from "./workspace-memory.js";
+import type { TaskPlan } from "./task-plan.js";
 import { WEB_PAGE } from "./web-page.js";
 
 type AgentRunner = Pick<AgentLoop, "runTurn">;
@@ -26,6 +27,8 @@ export interface WebServerOptions {
   loadHistory: (sessionId: string) => Promise<SessionHistoryView>;
   // Web 只提供 MEMORY.md 和最近每日记忆的读取视图；写入统一由 workspace 文件工具承担。
   loadMemory: () => Promise<WorkspaceMemoryContext>;
+  loadPlan: (sessionId: string) => Promise<TaskPlan | undefined>;
+  clearPlan: (sessionId: string) => Promise<boolean>;
   confirmationTimeoutMs?: number;
   page?: string;
 }
@@ -148,6 +151,26 @@ async function routeRequest(
     if (historyMatch) {
       const sessionId = requireSessionId(decodePathSegment(historyMatch[1] ?? ""));
       writeJson(response, 200, await options.loadHistory(sessionId));
+      return;
+    }
+    const planMatch = /^\/api\/sessions\/([^/]+)\/plan$/.exec(url.pathname);
+    if (planMatch) {
+      const sessionId = requireSessionId(decodePathSegment(planMatch[1] ?? ""));
+      writeJson(response, 200, { plan: await options.loadPlan(sessionId) ?? null });
+      return;
+    }
+  }
+
+  if (request.method === "DELETE") {
+    const planMatch = /^\/api\/sessions\/([^/]+)\/plan$/.exec(url.pathname);
+    if (planMatch) {
+      const sessionId = requireSessionId(decodePathSegment(planMatch[1] ?? ""));
+      if (busySessions.has(sessionId)) {
+        throw new HttpError(409, `session ${sessionId} already has a running turn`);
+      }
+      await options.clearPlan(sessionId);
+      response.writeHead(204, { "Cache-Control": "no-store" });
+      response.end();
       return;
     }
   }

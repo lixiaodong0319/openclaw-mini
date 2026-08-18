@@ -36,6 +36,7 @@ import {
   loadWorkspaceMemoryContext,
 } from "./workspace-memory.js";
 import { formatMemoryConsolidationPreview } from "./memory-consolidation.js";
+import { formatTaskPlan } from "./task-plan.js";
 
 async function main(): Promise<void> {
   // CLI 参数目前只解析 --session，保持入口足够小。
@@ -53,6 +54,8 @@ async function main(): Promise<void> {
   console.log(`Daily memory: ${describeDailyMemories(runtime.workspaceMemory)}`);
   const startupSkills = await runtime.skillManager.loadCatalog();
   console.log(`Skills: ${startupSkills.filter((skill) => skill.enabled).length} enabled, ${startupSkills.filter((skill) => !skill.enabled).length} disabled`);
+  const startupPlan = await runtime.taskPlan.loadPlan();
+  console.log(`Plan: ${startupPlan ? `${startupPlan.steps.filter((step) => step.status === "completed").length}/${startupPlan.steps.length} completed` : "none"}`);
   console.log(`MCP: ${runtime.mcp.serverCount} server(s), ${runtime.mcp.toolCount} tool(s)`);
   console.log("输入 /help 查看命令，输入 /exit 退出。\n");
 
@@ -139,7 +142,7 @@ async function executeCliCommand(
     output.write(`[命令] /${command} 需要 Session 名称。\n\n`);
     return undefined;
   }
-  if (!requiresArgument && command !== "memory" && argument.length > 0) {
+  if (!requiresArgument && command !== "memory" && command !== "plan" && argument.length > 0) {
     output.write(`[命令] /${command} 不接受参数。\n\n`);
     return undefined;
   }
@@ -152,6 +155,7 @@ async function executeCliCommand(
   if (command === "status") {
     const memory = await loadWorkspaceMemoryContext(context.config.workspaceRoot);
     const skills = await context.runtime.skillManager.loadCatalog();
+    const taskPlan = await context.runtime.taskPlan.loadPlan();
     output.write(`[状态]
 Session: ${context.runtime.sessionId}
 Provider: ${context.config.providerName}
@@ -160,7 +164,8 @@ Workspace: ${context.config.workspaceRoot}
 Instructions: ${context.instructions}
 Memory: ${describeWorkspaceMemory(memory.longTerm)}
 Daily memory: ${describeDailyMemories(memory)}
-Skills: ${skills.filter((skill) => skill.enabled).length} enabled, ${skills.filter((skill) => !skill.enabled).length} disabled\n\n`);
+Skills: ${skills.filter((skill) => skill.enabled).length} enabled, ${skills.filter((skill) => !skill.enabled).length} disabled
+Plan: ${taskPlan ? `${taskPlan.steps.filter((step) => step.status === "completed").length}/${taskPlan.steps.length} completed` : "none"}\n\n`);
     return undefined;
   }
 
@@ -250,6 +255,21 @@ Skills: ${skills.filter((skill) => skill.enabled).length} enabled, ${skills.filt
   if (command === "skills") {
     const skills = await context.runtime.skillManager.loadCatalog();
     output.write(`${formatSkillsStatus(skills)}\n\n`);
+    return undefined;
+  }
+
+  if (command === "plan") {
+    const action = argument.toLowerCase();
+    if (action.length > 0 && action !== "clear") {
+      output.write("[命令] /plan 只接受可选参数 clear。\n\n");
+      return undefined;
+    }
+    if (action === "clear") {
+      const cleared = await context.runtime.taskPlan.clearPlan();
+      output.write(cleared ? "[Plan] 当前任务计划已清除。\n\n" : "[Plan] 当前 Session 暂无任务计划。\n\n");
+      return undefined;
+    }
+    output.write(`${formatTaskPlan(await context.runtime.taskPlan.loadPlan())}\n\n`);
     return undefined;
   }
 
@@ -354,7 +374,7 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
   let lineOpen = false;
   let finished = false;
 
-  const writeStatus = (category: "工具" | "会话" | "记忆", message: string): void => {
+  const writeStatus = (category: "工具" | "会话" | "记忆" | "计划", message: string): void => {
     if (lineOpen) output.write("\n");
     output.write(`[${category}] ${message}\n`);
     lineOpen = false;
@@ -392,6 +412,12 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
       }
       if (event.type === "memory_flush_error") {
         writeStatus("记忆", `保存失败，继续压缩：${event.message}`);
+        return;
+      }
+      if (event.type === "plan_updated") {
+        if (lineOpen) output.write("\n");
+        output.write(`${formatTaskPlan(event.plan)}\n`);
+        lineOpen = false;
         return;
       }
       if (event.type === "tool_start") {

@@ -679,6 +679,45 @@ describe("tools", () => {
     }));
   });
 
+  it("validates and dispatches auto-approved task plan updates", async () => {
+    const taskPlan = {
+      updatePlan: vi.fn(async (steps) => ({
+        version: 1 as const,
+        updatedAt: "2026-08-17T00:00:00.000Z",
+        steps: [...steps],
+      })),
+      loadPlan: vi.fn(),
+    };
+    const input = {
+      steps: [
+        { content: "分析代码", status: "completed" },
+        { content: "实现功能", status: "in_progress" },
+      ],
+    };
+
+    const result = JSON.parse(await executeTool("update_plan", input, { workspaceRoot, taskPlan }));
+
+    expect(result.steps).toEqual(input.steps);
+    expect(taskPlan.updatePlan).toHaveBeenCalledWith(input.steps);
+    await expect(executeTool("update_plan", {
+      steps: [
+        { content: "one", status: "in_progress" },
+        { content: "two", status: "in_progress" },
+      ],
+    }, { workspaceRoot, taskPlan })).rejects.toThrow("at most one in_progress");
+    await expect(executeTool("update_plan", input, { workspaceRoot }))
+      .rejects.toThrow("task plan store is not configured");
+  });
+
+  it("exposes update_plan to both Providers", () => {
+    expect(toolDefinitions).toContainEqual(expect.objectContaining({ name: "update_plan" }));
+    expect(openAIToolDefinitions).toContainEqual(expect.objectContaining({
+      type: "function",
+      name: "update_plan",
+      strict: true,
+    }));
+  });
+
   it("schedules a derived memory-index sync after successful file writes", async () => {
     const memoryIndex = {
       search: vi.fn(),
@@ -702,6 +741,7 @@ describe("tools", () => {
     expect(requiresToolConfirmation("search_files")).toBe(false);
     expect(requiresToolConfirmation("read_text_file")).toBe(false);
     expect(requiresToolConfirmation("read_skill")).toBe(false);
+    expect(requiresToolConfirmation("update_plan")).toBe(false);
     expect(requiresToolConfirmation("memory_search")).toBe(false);
     expect(requiresToolConfirmation("memory_get")).toBe(false);
     expect(requiresToolConfirmation("git_status")).toBe(false);

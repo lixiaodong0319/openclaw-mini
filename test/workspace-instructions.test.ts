@@ -88,6 +88,23 @@ describe("workspace instructions", () => {
     expect(prompt).not.toContain("skills/code-review/SKILL.md");
   });
 
+  it("describes plan rules and injects the current Session progress", () => {
+    const prompt = buildSystemPrompt(undefined, undefined, [], {
+      version: 1,
+      updatedAt: "2026-08-17T00:00:00.000Z",
+      steps: [
+        { content: "Analyze", status: "completed" },
+        { content: "Implement", status: "in_progress" },
+      ],
+    });
+
+    expect(prompt).toContain("use update_plan");
+    expect(prompt).toContain("at most one in_progress");
+    expect(prompt).toContain("<current_task_plan");
+    expect(prompt).toContain('"content": "Implement"');
+    expect(buildSystemPrompt()).not.toContain("<current_task_plan");
+  });
+
   it("adds MEMORY.md Markdown as bounded user context", () => {
     const prompt = buildSystemPrompt(undefined, {
       longTerm: {
