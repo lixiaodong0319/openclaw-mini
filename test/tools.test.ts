@@ -381,7 +381,7 @@ describe("tools", () => {
 
   it("searches text files recursively with line and column locations", async () => {
     await fs.mkdir(path.join(workspaceRoot, "src"));
-    await fs.writeFile(path.join(workspaceRoot, "README.md"), "OpenClaw Mini\n", "utf8");
+    await fs.writeFile(path.join(workspaceRoot, "README.md"), "OpenClaw\n", "utf8");
     await fs.writeFile(path.join(workspaceRoot, "src", "agent.ts"), "first line\nconst name = 'OpenClaw';\n", "utf8");
 
     const output = JSON.parse(await executeTool(
@@ -399,7 +399,7 @@ describe("tools", () => {
       query: "OpenClaw",
       path: ".",
       matches: [
-        { path: "README.md", line: 1, column: 1, text: "OpenClaw Mini" },
+        { path: "README.md", line: 1, column: 1, text: "OpenClaw" },
         { path: "src/agent.ts", line: 2, column: 15, text: "const name = 'OpenClaw';" },
       ],
       truncated: false,

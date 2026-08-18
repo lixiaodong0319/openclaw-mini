@@ -118,7 +118,7 @@ async function main(): Promise<void> {
   process.once("SIGINT", handleSignal);
   process.once("SIGTERM", handleSignal);
 
-  console.log(`OpenClaw Mini Web: http://${host}:${port}`);
+  console.log(`OpenClaw Web: http://${host}:${port}`);
   console.log(`Provider: ${config.providerName}`);
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);

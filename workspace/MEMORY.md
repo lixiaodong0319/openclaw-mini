@@ -4,4 +4,4 @@
 
   # 项目信息
 
-  OpenClaw Mini 使用 SQLite 保存派生的记忆索引。
+  OpenClaw 使用 SQLite 保存派生的记忆索引。

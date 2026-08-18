@@ -182,7 +182,7 @@ function requestPinnedUrl(
         accept: "text/*, application/json, application/xml, application/*+json, application/*+xml;q=0.9",
         // 不自动解压响应，避免压缩炸弹绕过 maxBytes 原始正文限制。
         "accept-encoding": "identity",
-        "user-agent": "OpenClaw-Mini/1.0",
+        "user-agent": "OpenClaw/1.0",
       },
     }, (response) => {
       const status = response.statusCode ?? 0;

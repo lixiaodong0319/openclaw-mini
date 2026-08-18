@@ -1,4 +1,4 @@
-# OpenClaw Mini
+# OpenClaw
 
 一个用于学习 Agent 原理的最小 OpenClaw-like 本地助手。它不是官方 OpenClaw 的兼容实现，不包含 Gateway、插件或消息渠道，聚焦“模型调用 → 工具调用 → 工具结果回填 → 继续对话”循环，并提供两个最小专用子 Agent。
 
@@ -493,7 +493,7 @@ export OPENCLAW_WEB_PORT="3000"
 
 ```bash
 mkdir -p workspace
-printf "hello mini agent" > workspace/note.txt
+printf "hello OpenClaw agent" > workspace/note.txt
 pnpm dev -- --session demo
 ```
 

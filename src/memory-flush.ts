@@ -10,7 +10,7 @@ import {
 // 避免自动压缩不断追加内容后，生成一个无法被后续 memory_search 索引的文件。
 const MAX_DAILY_MEMORY_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_MEMORY_FLUSH_BYTES = 64 * 1024;
-const MEMORY_FLUSH_MARKER_PREFIX = "openclaw-mini:memory-flush:";
+const MEMORY_FLUSH_MARKER_PREFIX = "openclaw:memory-flush:";
 
 export interface MemoryFlushResult {
   path: string;

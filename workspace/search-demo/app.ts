@@ -1,4 +1,4 @@
-const appName = "OpenClaw Mini";
+const appName = "OpenClaw";
 const searchMarker = "SEARCH_DEMO";
 
 console.log(appName, searchMarker);

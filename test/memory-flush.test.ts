@@ -28,7 +28,7 @@ describe("WorkspaceMemoryFlusher", () => {
     expect(content).toContain("# 2026-08-17");
     expect(content).toContain("## 压缩前会话记忆 09:08:07");
     expect(content).toContain("用户选择 TypeScript。\n尚未完成发布流程。");
-    expect(content).toMatch(/openclaw-mini:memory-flush:[a-f0-9]{64}/u);
+    expect(content).toMatch(/openclaw:memory-flush:[a-f0-9]{64}/u);
   });
 
   it("preserves handwritten content and skips an identical summary", async () => {

@@ -5,10 +5,10 @@ export const WEB_PAGE = String.raw`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenClaw Mini</title>
+  <title>OpenClaw</title>
 </head>
 <body>
-  <h1>OpenClaw Mini</h1>
+  <h1>OpenClaw</h1>
   <p id="runtime">正在读取配置...</p>
 
   <label for="session">Session：</label>

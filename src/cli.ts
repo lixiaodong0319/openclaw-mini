@@ -51,7 +51,7 @@ async function main(): Promise<void> {
   let runtime = await createAgentRuntime(initialSessionId, config);
   const attachmentQueue = new AttachmentQueue(config.workspaceRoot);
 
-  console.log(`OpenClaw Mini session: ${runtime.sessionId}`);
+  console.log(`OpenClaw session: ${runtime.sessionId}`);
   console.log(`Provider: ${config.providerName}`);
   console.log(`Model: ${config.model}`);
   console.log(`Workspace: ${config.workspaceRoot}`);

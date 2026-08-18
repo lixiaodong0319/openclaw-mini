@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug OpenClaw Mini CLI",
+      "name": "Debug OpenClaw CLI",
       "type": "node",
       "request": "launch",
       "runtimeExecutable": "node",

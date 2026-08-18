@@ -26,7 +26,7 @@ tools/call: {
 }
 ```
 
-要让 OpenClaw Mini 连接这个 Server，在项目根目录的 `mcp.json` 加入：
+要让 OpenClaw 连接这个 Server，在项目根目录的 `mcp.json` 加入：
 
 ```json
 {

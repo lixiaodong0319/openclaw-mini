@@ -14,7 +14,7 @@ import {
   type SubagentType,
 } from "./subagents.js";
 
-export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.`;
+export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw, a local single-user assistant.`;
 
 export interface ToolCallRequest {
   // id 由 Provider API 生成，回填工具结果时必须原样使用。

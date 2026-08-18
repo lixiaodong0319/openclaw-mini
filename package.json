@@ -1,9 +1,9 @@
 {
-  "name": "openclaw-mini",
+  "name": "openclaw",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "A minimal OpenClaw-like agent loop for local experimentation.",
+  "description": "An OpenClaw agent loop for local experimentation.",
   "engines": {
     "node": ">=22"
   },

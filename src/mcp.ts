@@ -451,7 +451,7 @@ async function connectStdioServer(
   config: McpStdioServerConfig,
   projectRoot: string,
 ): Promise<McpConnection> {
-  const client = new Client({ name: "openclaw-mini", version: "1.0.0" });
+  const client = new Client({ name: "openclaw", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: config.command,
     args: config.args,
@@ -475,7 +475,7 @@ async function connectStreamableHttpServer(
   serverName: string,
   config: McpStreamableHttpServerConfig,
 ): Promise<McpConnection> {
-  const client = new Client({ name: "openclaw-mini", version: "1.0.0" });
+  const client = new Client({ name: "openclaw", version: "1.0.0" });
   const headers: Record<string, string> = { ...config.headers };
   if (config.token) headers.Authorization = `Bearer ${config.token}`;
   const transport = new StreamableHTTPClientTransport(new URL(config.url), {
