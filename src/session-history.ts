@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { CONTEXT_SUMMARY_ACK, CONTEXT_SUMMARY_PREFIX } from "./context-compaction.js";
-import type { OpenAIInputItem } from "./provider.js";
+import type { OpenAIInputItem, OpenAIUserInput } from "./provider.js";
 import type { RuntimeConfig } from "./runtime.js";
 import { SessionStore } from "./session-store.js";
 
@@ -104,7 +104,7 @@ export function normalizeOpenAIHistory(items: OpenAIInputItem[]): HistoryEntry[]
 
   for (const item of items) {
     if (isOpenAIUserMessage(item)) {
-      appendUserOrSummary(entries, item.content);
+      appendUserOrSummary(entries, extractOpenAIUserInputText(item.content));
       continue;
     }
     if (item.type === "function_call" && typeof item.call_id === "string" && typeof item.name === "string") {
@@ -159,8 +159,18 @@ function appendMessage(entries: HistoryEntry[], role: "user" | "assistant", text
   if (normalized.length > 0) entries.push({ type: "message", role, text: normalized });
 }
 
-function isOpenAIUserMessage(item: OpenAIInputItem): item is { role: "user"; content: string } {
-  return "role" in item && item.role === "user" && typeof item.content === "string";
+function isOpenAIUserMessage(item: OpenAIInputItem): item is OpenAIUserInput {
+  return "role" in item
+    && item.role === "user"
+    && (typeof item.content === "string" || Array.isArray(item.content));
+}
+
+function extractOpenAIUserInputText(content: OpenAIUserInput["content"]): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((part) => part.type === "input_text")
+    .map((part) => part.text)
+    .join("\n");
 }
 
 function extractOpenAIMessageText(item: Record<string, unknown>): string {

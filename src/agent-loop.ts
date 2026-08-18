@@ -6,6 +6,7 @@ import {
   WorkspaceMemoryConsolidator,
 } from "./memory-consolidation.js";
 import type { TaskPlan } from "./task-plan.js";
+import type { UserAttachment } from "./attachments.js";
 
 export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.`;
 
@@ -88,7 +89,7 @@ export interface AgentProvider {
   ): Promise<ContextCompactionResult | undefined>;
   // 清空同样由 Provider 执行，确保内存中的原生历史和持久化 JSONL 一起替换。
   clearHistory?(): Promise<void>;
-  addUserText(text: string): Promise<void>;
+  addUserText(text: string, attachments?: readonly UserAttachment[]): Promise<void>;
   generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn>;
   addToolResults(results: ToolExecutionResult[]): Promise<void>;
   // 记忆整理是独立的无工具请求，不追加到普通 Session 历史。Provider 只负责调用
@@ -140,6 +141,7 @@ export class AgentLoop {
     userText: string,
     onEvent?: AgentEventHandler,
     confirmTool?: ToolConfirmationHandler,
+    attachments: readonly UserAttachment[] = [],
   ): Promise<TurnResult> {
     // 压缩必须放在 addUserText 之前：
     // 1. 此时上一轮已经完整结束，不会把当前工具调用链拦腰切断；
@@ -147,7 +149,9 @@ export class AgentLoop {
     // 3. 摘要失败时还没有持久化本轮用户消息，用户可以安全重试。
     await this.compactContextIfAvailable(onEvent, false);
 
-    await this.provider.addUserText(userText);
+    // 附件与真实用户文本组成同一条 Provider 原生消息，这样图片不是工具输出，
+    // 文本附件也不会被误当成更高优先级的 system 指令。
+    await this.provider.addUserText(userText, attachments);
 
     for (let iteration = 0; iteration < this.maxIterations; iteration += 1) {
       // 每次循环对应一次模型调用。一轮对话可能因工具结果回填而经历多次模型调用。

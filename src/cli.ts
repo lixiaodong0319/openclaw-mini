@@ -37,6 +37,11 @@ import {
 } from "./workspace-memory.js";
 import { formatMemoryConsolidationPreview } from "./memory-consolidation.js";
 import { formatTaskPlan } from "./task-plan.js";
+import {
+  AttachmentQueue,
+  formatAttachment,
+  formatAttachmentList,
+} from "./attachments.js";
 
 async function main(): Promise<void> {
   // CLI 参数目前只解析 --session，保持入口足够小。
@@ -44,6 +49,7 @@ async function main(): Promise<void> {
   const initialSessionId = parseSessionId(process.argv.slice(2));
   const config = resolveRuntimeConfig();
   let runtime = await createAgentRuntime(initialSessionId, config);
+  const attachmentQueue = new AttachmentQueue(config.workspaceRoot);
 
   console.log(`OpenClaw Mini session: ${runtime.sessionId}`);
   console.log(`Provider: ${config.providerName}`);
@@ -90,6 +96,7 @@ async function main(): Promise<void> {
             config,
             instructions: describeWorkspaceInstructions(runtime.workspaceInstructions),
             rl,
+            attachmentQueue,
           });
           if (replacement) runtime = replacement;
         } catch (error) {
@@ -101,12 +108,16 @@ async function main(): Promise<void> {
       }
 
       const renderer = createTurnRenderer();
+      const attachments = attachmentQueue.snapshot();
       try {
         await runtime.agent.runTurn(
           line,
           renderer.handle,
           (request) => confirmToolCall(rl, request),
+          attachments,
         );
+        // 只有模型轮次完整成功后才消费附件；认证或网络失败时保留，用户可以直接重试。
+        if (attachments.length > 0) attachmentQueue.clear();
         renderer.finish();
       } catch (error) {
         renderer.finish();
@@ -127,6 +138,7 @@ interface CliCommandContext {
   config: RuntimeConfig;
   instructions: string;
   rl: Interface;
+  attachmentQueue: AttachmentQueue;
 }
 
 async function executeCliCommand(
@@ -142,7 +154,11 @@ async function executeCliCommand(
     output.write(`[命令] /${command} 需要 Session 名称。\n\n`);
     return undefined;
   }
-  if (!requiresArgument && command !== "memory" && command !== "plan" && argument.length > 0) {
+  if (!requiresArgument
+    && command !== "memory"
+    && command !== "plan"
+    && command !== "attach"
+    && argument.length > 0) {
     output.write(`[命令] /${command} 不接受参数。\n\n`);
     return undefined;
   }
@@ -165,7 +181,8 @@ Instructions: ${context.instructions}
 Memory: ${describeWorkspaceMemory(memory.longTerm)}
 Daily memory: ${describeDailyMemories(memory)}
 Skills: ${skills.filter((skill) => skill.enabled).length} enabled, ${skills.filter((skill) => !skill.enabled).length} disabled
-Plan: ${taskPlan ? `${taskPlan.steps.filter((step) => step.status === "completed").length}/${taskPlan.steps.length} completed` : "none"}\n\n`);
+Plan: ${taskPlan ? `${taskPlan.steps.filter((step) => step.status === "completed").length}/${taskPlan.steps.length} completed` : "none"}
+Attachments: ${context.attachmentQueue.size} queued\n\n`);
     return undefined;
   }
 
@@ -244,6 +261,23 @@ Plan: ${taskPlan ? `${taskPlan.steps.filter((step) => step.status === "completed
   if (command === "history") {
     const history = await loadSessionHistory(context.config, context.runtime.sessionId);
     output.write(`${formatSessionHistory(history)}\n\n`);
+    return undefined;
+  }
+
+  if (command === "attach") {
+    if (argument.length === 0) {
+      output.write(`${formatAttachmentList(context.attachmentQueue.snapshot())}\n\n`);
+      return undefined;
+    }
+    if (argument.toLowerCase() === "clear") {
+      const cleared = context.attachmentQueue.clear();
+      output.write(cleared > 0
+        ? `[附件] 已清空 ${cleared} 个待发送附件。\n\n`
+        : "[附件] 当前没有待发送附件。\n\n");
+      return undefined;
+    }
+    const attachment = await context.attachmentQueue.add(argument);
+    output.write(`[附件] 已添加 ${formatAttachment(attachment)}；将在下一条普通消息中发送。\n\n`);
     return undefined;
   }
 

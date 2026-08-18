@@ -7,6 +7,7 @@ import type { MemoryFlushHandler } from "../src/memory-flush.js";
 import { WorkspaceMemoryConsolidator } from "../src/memory-consolidation.js";
 import { OpenAIProvider, type OpenAIInputItem, type OpenAIResponseItem } from "../src/provider.js";
 import { openAIResponse, FakeOpenAIProvider } from "./fake-openai-provider.js";
+import type { UserAttachment } from "../src/attachments.js";
 
 function outputMessage(text: string): OpenAIResponseItem {
   return {
@@ -82,6 +83,43 @@ describe("OpenAIProvider adapter", () => {
 
     await expect(loop.runTurn("hi")).resolves.toEqual({ text: "hello", stopReason: "completed" });
     expect(persisted).toHaveLength(2);
+  });
+
+  it("sends text and image attachments as Responses API content parts", async () => {
+    const client = new FakeOpenAIProvider([openAIResponse([outputMessage("analyzed")])]);
+    const loop = createLoop(client, [], workspaceRoot);
+    const attachments: UserAttachment[] = [{
+      kind: "text",
+      relativePath: "document.txt",
+      mediaType: "text/plain",
+      bytes: 5,
+      text: "hello",
+    }, {
+      kind: "image",
+      relativePath: "screenshot.png",
+      mediaType: "image/png",
+      bytes: 8,
+      data: "iVBORw0KGgo=",
+    }];
+
+    await loop.runTurn("分析附件", undefined, undefined, attachments);
+
+    expect(client.calls[0]?.input.at(-1)).toEqual({
+      role: "user",
+      content: [
+        { type: "input_text", text: "分析附件" },
+        {
+          type: "input_text",
+          text: "[Attached text file: \"document.txt\"]\n<attachment>\nhello\n</attachment>",
+        },
+        { type: "input_text", text: "[Attached image: \"screenshot.png\"]" },
+        {
+          type: "input_image",
+          image_url: "data:image/png;base64,iVBORw0KGgo=",
+          detail: "auto",
+        },
+      ],
+    });
   });
 
   it("enables the Responses API built-in web search tool", async () => {

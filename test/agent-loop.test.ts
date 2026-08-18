@@ -9,6 +9,7 @@ import { WorkspaceMemoryConsolidator } from "../src/memory-consolidation.js";
 import type { TaskPlan, TaskPlanToolService } from "../src/task-plan.js";
 import { AnthropicProvider, type MessageProvider } from "../src/provider.js";
 import { FakeProvider, message } from "./fake-provider.js";
+import type { UserAttachment } from "../src/attachments.js";
 
 function textBlock(text: string): Anthropic.TextBlock {
   return { type: "text", text, citations: [] } as Anthropic.TextBlock;
@@ -72,6 +73,42 @@ describe("AgentLoop", () => {
 
     await expect(loop.runTurn("hi")).resolves.toEqual({ text: "hello", stopReason: "end_turn" });
     expect(persisted).toHaveLength(2);
+  });
+
+  it("sends text and image attachments as one Anthropic user message", async () => {
+    const provider = new FakeProvider([message([textBlock("analyzed")], "end_turn")]);
+    const loop = createLoop(provider, [], workspaceRoot);
+    const attachments: UserAttachment[] = [{
+      kind: "text",
+      relativePath: "document.txt",
+      mediaType: "text/plain",
+      bytes: 5,
+      text: "hello",
+    }, {
+      kind: "image",
+      relativePath: "screenshot.png",
+      mediaType: "image/png",
+      bytes: 8,
+      data: "iVBORw0KGgo=",
+    }];
+
+    await loop.runTurn("分析附件", undefined, undefined, attachments);
+
+    expect(provider.calls[0]?.messages.at(-1)).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "分析附件" },
+        {
+          type: "text",
+          text: "[Attached text file: \"document.txt\"]\n<attachment>\nhello\n</attachment>",
+        },
+        { type: "text", text: "[Attached image: \"screenshot.png\"]" },
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" },
+        },
+      ],
+    });
   });
 
   it("adds dynamically discovered MCP tools and requires confirmation", async () => {

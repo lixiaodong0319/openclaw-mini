@@ -100,6 +100,38 @@ describe("session history view", () => {
     expect(JSON.stringify(history)).not.toContain("hidden output");
   });
 
+  it("shows attachment labels but never exposes persisted base64 image data", () => {
+    const base64 = "VERY_SECRET_IMAGE_BASE64";
+    const anthropic = normalizeAnthropicHistory([{
+      role: "user",
+      content: [
+        { type: "text", text: "analyze" },
+        { type: "text", text: "[Attached image: \"screen.png\"]" },
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: base64 },
+        },
+      ],
+    }]);
+    const openai = normalizeOpenAIHistory([{
+      role: "user",
+      content: [
+        { type: "input_text", text: "analyze" },
+        { type: "input_text", text: "[Attached image: \"screen.png\"]" },
+        {
+          type: "input_image",
+          image_url: `data:image/png;base64,${base64}`,
+          detail: "auto",
+        },
+      ],
+    }]);
+
+    expect(JSON.stringify(anthropic)).toContain("screen.png");
+    expect(JSON.stringify(openai)).toContain("screen.png");
+    expect(JSON.stringify(anthropic)).not.toContain(base64);
+    expect(JSON.stringify(openai)).not.toContain(base64);
+  });
+
   it("loads the selected Provider namespace and limits long history", async () => {
     const dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-history-"));
     const store = new SessionStore<OpenAIInputItem>(dataRoot, "long", "openai");

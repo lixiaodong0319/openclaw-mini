@@ -26,6 +26,7 @@ describe("CLI commands", () => {
       "rename",
       "delete",
       "history",
+      "attach",
       "mcp",
       "skills",
       "plan",

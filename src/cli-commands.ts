@@ -11,6 +11,8 @@ export const CLI_HELP_TEXT = `内置命令:
   /rename <new-id>  重命名当前 Session
   /delete <id>      删除 Session（需要确认）
   /history          查看当前 Session 的安全历史视图
+  /attach <path>    将 workspace 文本或图片附加到下一条消息
+  /attach           查看待发送附件；/attach clear 清空
   /mcp              查看已连接的 MCP Server 和工具
   /skills           查看已发现的 workspace Skills
   /plan             查看当前 Session 的任务计划
@@ -30,6 +32,7 @@ export type CliCommandName =
   | "rename"
   | "delete"
   | "history"
+  | "attach"
   | "mcp"
   | "skills"
   | "plan"
@@ -52,6 +55,7 @@ const CLI_COMMAND_NAMES = new Set<CliCommandName>([
   "rename",
   "delete",
   "history",
+  "attach",
   "mcp",
   "skills",
   "plan",

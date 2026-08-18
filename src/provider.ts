@@ -25,6 +25,10 @@ import {
   toolDefinitions,
   type OpenAIToolDefinition,
 } from "./tools.js";
+import {
+  formatTextAttachmentContent,
+  type UserAttachment,
+} from "./attachments.js";
 
 // 低层客户端接口用于注入官方 SDK 或 Fake Provider。
 export interface MessageProvider {
@@ -177,8 +181,25 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
     return text;
   }
 
-  async addUserText(text: string): Promise<void> {
-    await this.addMessage({ role: "user", content: [{ type: "text", text }] });
+  async addUserText(text: string, attachments: readonly UserAttachment[] = []): Promise<void> {
+    const content: Anthropic.ContentBlockParam[] = [{ type: "text", text }];
+    for (const attachment of attachments) {
+      if (attachment.kind === "text") {
+        content.push({ type: "text", text: formatTextAttachmentContent(attachment) });
+        continue;
+      }
+      // 图片标签与 image block 相邻，多个附件时模型仍能知道每张图的 workspace 名称。
+      content.push({ type: "text", text: `[Attached image: ${JSON.stringify(attachment.relativePath)}]` });
+      content.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: attachment.mediaType,
+          data: attachment.data,
+        },
+      });
+    }
+    await this.addMessage({ role: "user", content });
   }
 
   async generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn> {
@@ -327,8 +348,12 @@ function extractText(content: Anthropic.Message["content"]): string {
 // 它们与 Anthropic 类型放在同一个 Provider 模块中，但不会泄漏到统一 AgentLoop。
 export interface OpenAIUserInput {
   role: "user";
-  content: string;
+  content: string | OpenAIUserContentPart[];
 }
+
+export type OpenAIUserContentPart =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string; detail: "auto" };
 
 export interface OpenAIFunctionCallOutput {
   type: "function_call_output";
@@ -538,8 +563,29 @@ export class OpenAIProvider implements AgentProvider {
     return text;
   }
 
-  async addUserText(text: string): Promise<void> {
-    await this.addOpenAIItem({ role: "user", content: text });
+  async addUserText(text: string, attachments: readonly UserAttachment[] = []): Promise<void> {
+    if (attachments.length === 0) {
+      // 保持无附件历史的旧格式不变，已有 Session 和相关测试无需迁移。
+      await this.addOpenAIItem({ role: "user", content: text });
+      return;
+    }
+    const content: OpenAIUserContentPart[] = [{ type: "input_text", text }];
+    for (const attachment of attachments) {
+      if (attachment.kind === "text") {
+        content.push({ type: "input_text", text: formatTextAttachmentContent(attachment) });
+      } else {
+        content.push({
+          type: "input_text",
+          text: `[Attached image: ${JSON.stringify(attachment.relativePath)}]`,
+        });
+        content.push({
+          type: "input_image",
+          image_url: `data:${attachment.mediaType};base64,${attachment.data}`,
+          detail: "auto",
+        });
+      }
+    }
+    await this.addOpenAIItem({ role: "user", content });
   }
 
   async generateTurn(instructions: string, onTextDelta?: TextDeltaHandler): Promise<ProviderTurn> {
@@ -733,8 +779,18 @@ function isOpenAIUserTurnStart(item: OpenAIInputItem): boolean {
   // 排除带固定前缀的历史摘要，防止它消耗 keepRecentTurns 名额。
   return isRecord(item)
     && item.role === "user"
-    && typeof item.content === "string"
-    && !item.content.startsWith(CONTEXT_SUMMARY_PREFIX);
+    && (typeof item.content === "string" || Array.isArray(item.content))
+    && !extractOpenAIUserText(item.content).startsWith(CONTEXT_SUMMARY_PREFIX);
+}
+
+function extractOpenAIUserText(content: OpenAIUserInput["content"]): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((part): part is Extract<OpenAIUserContentPart, { type: "input_text" }> => (
+      part.type === "input_text"
+    ))
+    .map((part) => part.text)
+    .join("\n");
 }
 
 function extractOpenAIText(response: OpenAIResponse): string {

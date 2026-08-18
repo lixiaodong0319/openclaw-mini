@@ -5,6 +5,7 @@
 ## 功能
 
 - 本地命令行 REPL 对话，支持状态、历史、手动压缩和清空等内置命令
+- CLI `/attach` 可把 workspace 文本或图片加入下一条多模态消息
 - 本地 Web 对话，可选择、新建并回放 Session 历史
 - 模型文本流式输出，显示工具确认、执行中、完成和失败状态
 - Anthropic 与 OpenAI Provider，可通过环境变量切换
@@ -53,6 +54,7 @@
 
 ```text
 src/
+  attachments.ts     workspace 附件校验、读取和一次性发送队列
   apply-patch.ts     多文件补丁解析、预检和应用逻辑
   agent-loop.ts      厂商无关的统一 Agent Loop
   cli-commands.ts    CLI 命令解析、帮助和安全历史格式化
@@ -79,6 +81,7 @@ src/
   web-page.ts        无框架的单页聊天界面
 
 test/
+  attachments.test.ts    文本、图片附件和路径/大小安全边界测试
   agent-loop.test.ts     Agent Loop 测试
   apply-patch.test.ts    多文件补丁和安全边界测试
   cli-commands.test.ts   CLI 命令解析和历史格式化测试
@@ -334,6 +337,24 @@ Shell 命令默认最多运行 30 秒，可通过环境变量缩短或延长，�
 export OPENCLAW_COMMAND_TIMEOUT_MS="30000"
 ```
 
+### 文件附件
+
+CLI 可以把 `workspace/` 内的文本或图片排队到下一条普通消息：
+
+```text
+> /attach document.txt
+[附件] 已添加 document.txt (text, 1.2 KiB)；将在下一条普通消息中发送。
+
+> /attach screenshots/error.png
+[附件] 已添加 screenshots/error.png (image, 185.4 KiB)；将在下一条普通消息中发送。
+
+> 分析文档内容和截图中的报错
+```
+
+不带参数的 `/attach` 查看队列，`/attach clear` 清空队列。附件只在模型轮次成功后消费；认证或网络失败时继续保留，便于直接重试。文本文件以带路径和边界的用户内容发送，图片在 Anthropic 中转换成原生 image block，在 OpenAI Responses API 中转换成 `input_image` Base64 Data URL，因此需要当前模型支持视觉输入。
+
+附件路径必须相对于 `workspace/`，绝对路径、`..` 逃逸、目录和符号链接会被拒绝。一次最多排队 4 个、原始内容合计最多 10 MiB；单个文本最大 256 KiB且必须为无 NUL 的 UTF-8，单张图片最大 5 MiB并校验扩展名和文件签名。支持的图片为 JPEG、PNG、GIF、WebP；文本支持常见文档、配置、日志和源代码扩展名。图片和文本内容会写入对应 Provider 的原生 Session JSONL，以便后续请求合法回放，因此不要附加不希望保存在本机 `data/sessions/` 中的敏感文件。
+
 ### Anthropic SDK profile
 
 如果本机配置了 Anthropic SDK 可识别的本地 profile，也可以使用对应凭据。
@@ -360,6 +381,8 @@ pnpm dev -- --session smoke
 /help       查看命令帮助
 /status     查看当前 Provider、模型、Session、workspace 和指令状态
 /history    查看当前 Session 的安全历史视图
+/attach <path> 将 workspace 文本或图片附加到下一条消息
+/attach     查看待发送附件；/attach clear 清空
 /mcp        查看已连接的 MCP Server 和工具
 /skills     查看已发现的 workspace Skills
 /plan       查看当前 Session 的任务计划
