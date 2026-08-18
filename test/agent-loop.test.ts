@@ -2,7 +2,12 @@ import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { AgentLoop, type AgentEvent, type ToolExecutor } from "../src/agent-loop.js";
+import {
+  AgentLoop,
+  type AgentEvent,
+  type ToolConfirmationRequest,
+  type ToolExecutor,
+} from "../src/agent-loop.js";
 import type { ContextCompactionOptions } from "../src/context-compaction.js";
 import type { MemoryFlushHandler } from "../src/memory-flush.js";
 import { WorkspaceMemoryConsolidator } from "../src/memory-consolidation.js";
@@ -10,6 +15,7 @@ import type { TaskPlan, TaskPlanToolService } from "../src/task-plan.js";
 import { AnthropicProvider, type MessageProvider } from "../src/provider.js";
 import { FakeProvider, message } from "./fake-provider.js";
 import type { UserAttachment } from "../src/attachments.js";
+import type { SubagentRunner } from "../src/subagents.js";
 
 function textBlock(text: string): Anthropic.TextBlock {
   return { type: "text", text, citations: [] } as Anthropic.TextBlock;
@@ -33,7 +39,9 @@ function createLoop(
     memoryFlush?: MemoryFlushHandler;
     memoryConsolidator?: WorkspaceMemoryConsolidator;
     additionalTools?: Anthropic.Tool[];
+    excludedTools?: readonly string[];
     taskPlan?: TaskPlanToolService;
+    subagentRunner?: SubagentRunner;
   } = {},
 ): AgentLoop {
   return new AgentLoop({
@@ -45,10 +53,12 @@ function createLoop(
       onHistoryReplace: options.onHistoryReplace,
       compaction: options.compaction,
       additionalTools: options.additionalTools,
+      excludedTools: options.excludedTools,
     }),
     toolContext: { workspaceRoot, taskPlan: options.taskPlan },
     maxIterations: options.maxIterations,
     toolExecutor: options.toolExecutor,
+    subagentRunner: options.subagentRunner,
     systemPrompt: options.systemPrompt,
     memoryFlush: options.memoryFlush,
     memoryConsolidator: options.memoryConsolidator,
@@ -383,6 +393,153 @@ describe("AgentLoop", () => {
       toolCallId: "toolu_1",
       name: "calculator",
       isError: false,
+    });
+  });
+
+  it("filters parent-only tools from an Anthropic child provider", async () => {
+    const provider = new FakeProvider([message([textBlock("done")], "end_turn")]);
+    const loop = createLoop(provider, [], workspaceRoot, {
+      excludedTools: ["run_subagent", "update_plan"],
+    });
+
+    await loop.runTurn("focused child task");
+
+    const names = provider.calls[0]?.tools?.map((tool) => tool.name) ?? [];
+    expect(names).toContain("calculator");
+    expect(names).not.toContain("run_subagent");
+    expect(names).not.toContain("update_plan");
+  });
+
+  it("runs an approved sub-agent in an isolated context and returns its report", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_subagent", "run_subagent", {
+        agent: "test",
+        task: "检查 calculator 工具并报告测试结果",
+      })], "tool_use"),
+      message([textBlock("主 Agent 已整理测试报告")], "end_turn"),
+    ]);
+    const childRunner = vi.fn<SubagentRunner>(async (request, options) => {
+      expect(request).toEqual({
+        agent: "test",
+        task: "检查 calculator 工具并报告测试结果",
+      });
+      // 子 Agent 的有副作用工具仍然通过主会话确认回调，不能静默放行。
+      await options?.confirmTool?.({
+        toolCallId: "child_tool",
+        name: "run_command",
+        input: { command: "pnpm test -- calculator" },
+      });
+      options?.onEvent?.({
+        type: "tool_start",
+        toolCallId: "child_tool",
+        name: "run_command",
+      });
+      return { text: "calculator 测试通过", stopReason: "end_turn" };
+    });
+    const loop = createLoop(provider, [], workspaceRoot, { subagentRunner: childRunner });
+    const events: AgentEvent[] = [];
+    const confirm = vi.fn(async (_request: ToolConfirmationRequest) => true);
+
+    await expect(loop.runTurn("委派测试", (event) => events.push(event), confirm))
+      .resolves.toEqual({ text: "主 Agent 已整理测试报告", stopReason: "end_turn" });
+
+    expect(childRunner).toHaveBeenCalledOnce();
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(confirm.mock.calls[1]?.[0]).toMatchObject({
+      name: "run_command",
+      subagent: "test",
+    });
+    expect(events).toContainEqual({
+      type: "subagent_start",
+      toolCallId: "toolu_subagent",
+      agent: "test",
+      task: "检查 calculator 工具并报告测试结果",
+    });
+    expect(events).toContainEqual({
+      type: "tool_start",
+      toolCallId: "child_tool",
+      name: "run_command",
+      subagent: "test",
+    });
+    expect(events).toContainEqual({
+      type: "subagent_end",
+      toolCallId: "toolu_subagent",
+      agent: "test",
+      isError: false,
+    });
+    expect(provider.calls[1]?.messages.at(-1)).toEqual({
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_subagent",
+        content: [{
+          type: "text",
+          text: expect.stringContaining('"agent": "test"'),
+        }],
+      }],
+    });
+  });
+
+  it("does not create a sub-agent when delegation is denied", async () => {
+    const provider = new FakeProvider([
+      message([toolUseBlock("toolu_subagent", "run_subagent", {
+        agent: "docs",
+        task: "解释 provider 流程",
+      })], "tool_use"),
+      message([textBlock("已取消委派")], "end_turn"),
+    ]);
+    const childRunner = vi.fn<SubagentRunner>();
+    const loop = createLoop(provider, [], workspaceRoot, { subagentRunner: childRunner });
+
+    await loop.runTurn("不要真的委派", undefined, async () => false);
+
+    expect(childRunner).not.toHaveBeenCalled();
+    expect(provider.calls[1]?.messages.at(-1)).toEqual({
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_subagent",
+        is_error: true,
+        content: [{ type: "text", text: "Tool execution denied by user: run_subagent" }],
+      }],
+    });
+  });
+
+  it("runs multiple approved sub-agents from one model turn in parallel", async () => {
+    const provider = new FakeProvider([
+      message([
+        toolUseBlock("toolu_test", "run_subagent", { agent: "test", task: "run tests" }),
+        toolUseBlock("toolu_docs", "run_subagent", { agent: "docs", task: "review docs" }),
+      ], "tool_use"),
+      message([textBlock("combined")], "end_turn"),
+    ]);
+    let started = 0;
+    let releaseChildren!: () => void;
+    let reportBothStarted!: () => void;
+    const release = new Promise<void>((resolve) => { releaseChildren = resolve; });
+    const bothStarted = new Promise<void>((resolve) => { reportBothStarted = resolve; });
+    const childRunner = vi.fn<SubagentRunner>(async (request) => {
+      started += 1;
+      if (started === 2) reportBothStarted();
+      await release;
+      return { text: `${request.agent} report`, stopReason: "end_turn" };
+    });
+    const loop = createLoop(provider, [], workspaceRoot, { subagentRunner: childRunner });
+
+    const turn = loop.runTurn("delegate both", undefined, async () => true);
+    // 只有两个 runner 都在等待同一道门时才释放；若调度被改成串行，测试会超时。
+    await bothStarted;
+    expect(childRunner).toHaveBeenCalledTimes(2);
+    releaseChildren();
+    await expect(turn).resolves.toEqual({ text: "combined", stopReason: "end_turn" });
+
+    const toolResults = provider.calls[1]?.messages.at(-1);
+    expect(toolResults).toMatchObject({
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "toolu_test" },
+        { type: "tool_result", tool_use_id: "toolu_docs" },
+      ],
     });
   });
 

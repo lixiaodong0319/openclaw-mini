@@ -23,6 +23,7 @@ import {
   type TaskPlanStep,
   type TaskPlanToolService,
 } from "./task-plan.js";
+import { MAX_SUBAGENT_TASK_BYTES, SUBAGENT_TYPES } from "./subagents.js";
 
 // 直接复用 SDK 的 Tool 类型，确保工具定义形状和 Anthropic SDK 保持一致。
 // 不额外声明自定义 Tool interface，可以避免 SDK 升级后字段含义或类型漂移。
@@ -377,6 +378,29 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "run_subagent",
+    description: "Delegate one focused task to an independent test or documentation sub-agent. Use test for verification, failure analysis, and test recommendations; use docs for code-flow analysis and documentation work. The child receives a fresh conversation context, shares the restricted workspace, cannot delegate recursively, and returns only its final report to this Agent. For multi-step work, track delegated tasks in the parent update_plan. This tool requires user confirmation.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        agent: {
+          type: "string",
+          enum: [...SUBAGENT_TYPES],
+          description: "The specialized child role: test or docs.",
+        },
+        task: {
+          type: "string",
+          minLength: 1,
+          maxLength: MAX_SUBAGENT_TASK_BYTES,
+          description: "One self-contained delegated task. Include the expected output and relevant paths, but do not paste large file contents.",
+        },
+      },
+      required: ["agent", "task"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "memory_search",
     description: "Search long-term MEMORY.md and every memory/*.md file using local FTS5/BM25 plus optional semantic Embeddings. Call this when relevant durable or older daily context may not be present in the current prompt. This tool is read-only and falls back to keywords when vectors are unavailable.",
     strict: true,
@@ -626,6 +650,10 @@ export async function executeTool(
       const plan = await requireTaskPlanService(context).updatePlan(parseUpdatePlanInput(input).steps);
       return JSON.stringify(plan, null, 2);
     }
+    case "run_subagent":
+      // 子 Agent 需要继承当前轮的确认回调和事件通道，只能由 AgentLoop 调度。
+      // 直接调用 executeTool 没有这些可信宿主能力，因此明确拒绝而不是静默运行。
+      throw new Error("run_subagent must be executed by AgentLoop");
     case "memory_search": {
       const parsed = parseMemorySearchInput(input);
       const result = await requireMemoryIndex(context).search(parsed.query, parsed.maxResults);

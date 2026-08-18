@@ -49,6 +49,9 @@ export interface AnthropicProviderOptions {
   onHistoryReplace?: (messages: Anthropic.MessageParam[]) => Promise<void>;
   compaction?: Partial<ContextCompactionOptions>;
   additionalTools?: Anthropic.Tool[];
+  // 子 Agent 复用 Provider，但不能看到 run_subagent/update_plan 等宿主保留工具。
+  // 过滤发生在发送 API 前，不能只依赖提示词要求模型不要调用。
+  excludedTools?: readonly string[];
 }
 
 // Anthropic Messages API 适配器。
@@ -70,7 +73,10 @@ export class AnthropicProvider implements AgentProvider, MessageProvider {
       this.onMessage = options.onMessage;
       this.onHistoryReplace = options.onHistoryReplace;
       this.compaction = resolveContextCompactionOptions(options.compaction);
-      this.tools = [...toolDefinitions, ...(options.additionalTools ?? [])];
+      this.tools = filterToolsByName(
+        [...toolDefinitions, ...(options.additionalTools ?? [])],
+        options.excludedTools,
+      );
       return;
     }
 
@@ -411,6 +417,7 @@ export interface OpenAIProviderOptions {
   onHistoryReplace?: (items: OpenAIInputItem[]) => Promise<void>;
   compaction?: Partial<ContextCompactionOptions>;
   additionalTools?: OpenAIToolDefinition[];
+  excludedTools?: readonly string[];
 }
 
 interface FunctionCallItem extends OpenAIResponseItem {
@@ -472,7 +479,13 @@ export class OpenAIProvider implements AgentProvider {
     this.compaction = resolveContextCompactionOptions(options.compaction);
     // Web Search 是 Responses API 托管的内置工具；它不进入本地 AgentLoop
     // 的 function_call 确认和 executeTool 分发，也不影响 Anthropic 工具清单。
-    this.tools = [...openAIToolDefinitions, ...(options.additionalTools ?? []), { type: "web_search" }];
+    this.tools = [
+      ...filterToolsByName(
+        [...openAIToolDefinitions, ...(options.additionalTools ?? [])],
+        options.excludedTools,
+      ),
+      { type: "web_search" },
+    ];
   }
 
   async compactHistoryIfNeeded(
@@ -935,6 +948,15 @@ function extractOpenAIAPIError(payload: unknown): { message: string; code?: stri
     };
   }
   return { message: "OpenAI API request failed" };
+}
+
+function filterToolsByName<T extends { name: string }>(
+  tools: readonly T[],
+  excludedTools?: readonly string[],
+): T[] {
+  if (!excludedTools || excludedTools.length === 0) return [...tools];
+  const excluded = new Set(excludedTools);
+  return tools.filter((tool) => !excluded.has(tool.name));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -7,6 +7,12 @@ import {
 } from "./memory-consolidation.js";
 import type { TaskPlan } from "./task-plan.js";
 import type { UserAttachment } from "./attachments.js";
+import {
+  formatSubagentResult,
+  parseSubagentRequest,
+  type SubagentRunner,
+  type SubagentType,
+} from "./subagents.js";
 
 export const DEFAULT_SYSTEM_PROMPT = `You are OpenClaw Mini, a local single-user assistant.`;
 
@@ -29,6 +35,8 @@ export interface ToolConfirmationRequest {
   toolCallId: string;
   name: string;
   input: unknown;
+  // 子 Agent 发起的有副作用工具仍走主会话确认通道；标记仅用于界面说明来源。
+  subagent?: SubagentType;
 }
 
 export type ToolConfirmationHandler = (request: ToolConfirmationRequest) => boolean | Promise<boolean>;
@@ -45,11 +53,14 @@ export type AgentEvent =
   | { type: "memory_flush_start" }
   | { type: "memory_flush_end"; path: string; written: boolean; bytesWritten: number }
   | { type: "memory_flush_error"; message: string }
-  | { type: "tool_pending"; toolCallId: string; name: string; input: unknown }
-  | { type: "tool_approved"; toolCallId: string; name: string }
-  | { type: "tool_denied"; toolCallId: string; name: string }
-  | { type: "tool_start"; toolCallId: string; name: string }
-  | { type: "tool_end"; toolCallId: string; name: string; isError: boolean }
+  | { type: "tool_pending"; toolCallId: string; name: string; input: unknown; subagent?: SubagentType }
+  | { type: "tool_approved"; toolCallId: string; name: string; subagent?: SubagentType }
+  | { type: "tool_denied"; toolCallId: string; name: string; subagent?: SubagentType }
+  | { type: "tool_start"; toolCallId: string; name: string; subagent?: SubagentType }
+  | { type: "tool_end"; toolCallId: string; name: string; isError: boolean; subagent?: SubagentType }
+  // 生命周期事件只展示委派边界；子 Agent 的最终文本作为工具结果回填，不直接混入主输出。
+  | { type: "subagent_start"; toolCallId: string; agent: SubagentType; task: string }
+  | { type: "subagent_end"; toolCallId: string; agent: SubagentType; isError: boolean }
   // update_plan 可能和同一批其他工具并行执行；全部完成后只广播最终落盘版本。
   | { type: "plan_updated"; plan: TaskPlan };
 
@@ -105,6 +116,7 @@ export interface AgentLoopOptions {
   systemPrompt?: string | (() => string | Promise<string>);
   maxIterations?: number;
   toolExecutor?: ToolExecutor;
+  subagentRunner?: SubagentRunner;
   memoryFlush?: MemoryFlushHandler;
   memoryConsolidator?: WorkspaceMemoryConsolidator;
 }
@@ -122,6 +134,7 @@ export class AgentLoop {
   private readonly systemPrompt: string | (() => string | Promise<string>);
   private readonly maxIterations: number;
   private readonly toolExecutor: ToolExecutor;
+  private readonly subagentRunner?: SubagentRunner;
   private readonly memoryFlush?: MemoryFlushHandler;
   private readonly memoryConsolidator?: WorkspaceMemoryConsolidator;
 
@@ -133,6 +146,7 @@ export class AgentLoop {
     this.maxIterations = options.maxIterations ?? 8;
     // 正常运行使用 executeTool；可注入执行器便于测试“拒绝后绝对不执行”等调度语义。
     this.toolExecutor = options.toolExecutor ?? executeTool;
+    this.subagentRunner = options.subagentRunner;
     this.memoryFlush = options.memoryFlush;
     this.memoryConsolidator = options.memoryConsolidator;
   }
@@ -227,7 +241,7 @@ export class AgentLoop {
             }
             result = {
               toolCallId: call.id,
-              output: await this.toolExecutor(call.name, call.input, this.toolContext),
+              output: await this.executeApprovedTool(call, onEvent, confirmTool),
               isError: false,
             };
           } catch (error) {
@@ -299,6 +313,48 @@ export class AgentLoop {
     await this.provider.clearHistory();
   }
 
+  private async executeApprovedTool(
+    call: ToolCallRequest,
+    onEvent?: AgentEventHandler,
+    confirmTool?: ToolConfirmationHandler,
+  ): Promise<string> {
+    if (call.name !== "run_subagent") {
+      return this.toolExecutor(call.name, call.input, this.toolContext);
+    }
+    if (!this.subagentRunner) throw new Error("sub-agent runner is not configured");
+
+    const request = parseSubagentRequest(call.input);
+    onEvent?.({
+      type: "subagent_start",
+      toolCallId: call.id,
+      agent: request.agent,
+      task: request.task,
+    });
+
+    let isError = true;
+    try {
+      const result = await this.subagentRunner(request, {
+        // 子 Agent 的文本只回填给主模型，避免终端先打印子报告、随后又打印主模型整理结果。
+        // 工具事件则附加子角色后继续展示，让耗时测试或权限等待仍然可观察。
+        onEvent: onEvent ? (event) => forwardSubagentEvent(event, request.agent, onEvent) : undefined,
+        confirmTool: confirmTool ? (confirmation) => confirmTool({
+          ...confirmation,
+          subagent: request.agent,
+        }) : undefined,
+      });
+      const output = formatSubagentResult(request, result);
+      isError = false;
+      return output;
+    } finally {
+      onEvent?.({
+        type: "subagent_end",
+        toolCallId: call.id,
+        agent: request.agent,
+        isError,
+      });
+    }
+  }
+
   private async compactContextIfAvailable(
     onEvent: AgentEventHandler | undefined,
     force: boolean,
@@ -325,6 +381,26 @@ export class AgentLoop {
       onEvent?.({ type: "context_compaction_end", ...compaction });
     }
     return compaction;
+  }
+}
+
+function forwardSubagentEvent(
+  event: AgentEvent,
+  subagent: SubagentType,
+  onEvent: AgentEventHandler,
+): void {
+  switch (event.type) {
+    case "tool_pending":
+    case "tool_approved":
+    case "tool_denied":
+    case "tool_start":
+    case "tool_end":
+      onEvent({ ...event, subagent });
+      return;
+    // 子 Agent 的正文、计划和压缩事件属于它的临时上下文。正文通过 run_subagent 的
+    // tool_result 返回主模型；其余事件不应改变或伪装成主 Session 状态。
+    default:
+      return;
   }
 }
 

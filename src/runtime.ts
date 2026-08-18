@@ -26,6 +26,10 @@ import { WorkspaceMemoryConsolidator } from "./memory-consolidation.js";
 import { WorkspaceSkillManager } from "./skills.js";
 import { TaskPlanStore } from "./task-plan.js";
 import {
+  getSubagentRolePrompt,
+  type SubagentRunner,
+} from "./subagents.js";
+import {
   MEMORY_INDEX_RELATIVE_PATH,
   WorkspaceMemoryIndex,
 } from "./memory-index.js";
@@ -224,6 +228,46 @@ async function createAgent(
     if (mcp?.hasTool(name)) return mcp.execute(name, input);
     return executeTool(name, input, context);
   };
+  // 子 Agent 共享 workspace、记忆、Skills、MCP 和权限确认，但每次都创建空白 Provider
+  // 历史，且不配置任何 SessionStore 回调。它的中间对话因此不会混入或持久化到主会话。
+  const subagentRunner: SubagentRunner = async (request, options) => {
+    const childSystemPrompt = async (): Promise<string> => `${buildSystemPrompt(
+      workspaceInstructions,
+      await loadWorkspaceMemoryContext(workspaceRoot),
+      await skillManager?.loadCatalog() ?? [],
+      // 父计划由主 Agent 管理；子 Agent 不读写它，避免并行子任务互相覆盖状态。
+      undefined,
+      { includeAgentCoordination: false },
+    )}\n\n${getSubagentRolePrompt(request.agent)}`;
+    const childToolContext: ToolContext = {
+      ...toolContext,
+      taskPlan: undefined,
+    };
+    const excludedTools = ["run_subagent", "update_plan"];
+    const provider = providerName === "openai"
+      ? new OpenAIProvider({
+        model,
+        input: [],
+        compaction,
+        additionalTools: mcpDefinitions?.openai,
+        excludedTools,
+      })
+      : new AnthropicProvider({
+        model,
+        messages: [],
+        compaction,
+        additionalTools: mcpDefinitions?.anthropic,
+        excludedTools,
+      });
+    const child = new AgentLoop({
+      provider,
+      toolContext: childToolContext,
+      toolExecutor,
+      systemPrompt: childSystemPrompt,
+      // 不注入 subagentRunner，从能力清单和执行层双重禁止递归委派。
+    });
+    return child.runTurn(request.task, options?.onEvent, options?.confirmTool);
+  };
 
   if (providerName === "openai") {
     // 两种 Provider 使用独立 namespace，防止原生历史结构混入同一个 JSONL。
@@ -240,6 +284,7 @@ async function createAgent(
       }),
       toolContext,
       toolExecutor,
+      subagentRunner,
       systemPrompt,
       memoryFlush: memoryFlusher ? async (summary) => {
         const result = await memoryFlusher.flush(summary);
@@ -265,6 +310,7 @@ async function createAgent(
     }),
     toolContext,
     toolExecutor,
+    subagentRunner,
     systemPrompt,
     memoryFlush: memoryFlusher ? async (summary) => {
       const result = await memoryFlusher.flush(summary);

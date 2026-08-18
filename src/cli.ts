@@ -408,7 +408,7 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
   let lineOpen = false;
   let finished = false;
 
-  const writeStatus = (category: "工具" | "会话" | "记忆" | "计划", message: string): void => {
+  const writeStatus = (category: string, message: string): void => {
     if (lineOpen) output.write("\n");
     output.write(`[${category}] ${message}\n`);
     lineOpen = false;
@@ -454,24 +454,35 @@ function createTurnRenderer(): { handle: (event: AgentEvent) => void; finish: ()
         lineOpen = false;
         return;
       }
+      if (event.type === "subagent_start") {
+        writeStatus("子 Agent", `${event.agent} 已启动：${event.task}`);
+        return;
+      }
+      if (event.type === "subagent_end") {
+        writeStatus("子 Agent", `${event.agent} ${event.isError ? "失败" : "完成"}`);
+        return;
+      }
       if (event.type === "tool_start") {
-        writeStatus("工具", `${event.name} 执行中...`);
+        writeStatus(event.subagent ? `子 Agent ${event.subagent}` : "工具", `${event.name} 执行中...`);
         return;
       }
       if (event.type === "tool_pending") {
-        writeStatus("工具", `${event.name} 等待确认`);
+        writeStatus(event.subagent ? `子 Agent ${event.subagent}` : "工具", `${event.name} 等待确认`);
         return;
       }
       if (event.type === "tool_approved") {
-        writeStatus("工具", `${event.name} 已允许`);
+        writeStatus(event.subagent ? `子 Agent ${event.subagent}` : "工具", `${event.name} 已允许`);
         return;
       }
       if (event.type === "tool_denied") {
-        writeStatus("工具", `${event.name} 已拒绝`);
+        writeStatus(event.subagent ? `子 Agent ${event.subagent}` : "工具", `${event.name} 已拒绝`);
         return;
       }
       if (event.type === "tool_end") {
-        writeStatus("工具", `${event.name} ${event.isError ? "失败" : "完成"}`);
+        writeStatus(
+          event.subagent ? `子 Agent ${event.subagent}` : "工具",
+          `${event.name} ${event.isError ? "失败" : "完成"}`,
+        );
       }
     },
     finish: () => {
@@ -490,6 +501,7 @@ async function confirmToolCall(
 ): Promise<boolean> {
   // 先显示模型生成的完整结构化参数预览，再读取用户决定。
   // 默认是拒绝：只有明确的 y/yes 才返回 true，回车、拼写错误和其他输入都不执行。
+  if (request.subagent) output.write(`[子 Agent ${request.subagent}] 请求执行工具。\n`);
   output.write(`参数:\n${formatToolInput(request.input)}\n`);
   const answer = (await rl.question(`允许执行 ${request.name}？[y/N] `)).trim().toLowerCase();
   return answer === "y" || answer === "yes";

@@ -46,6 +46,7 @@ function createLoop(
       parameters: { type: "object"; properties: Record<string, object>; required: string[] };
       strict: boolean;
     }>;
+    excludedTools?: readonly string[];
   } = {},
 ): AgentLoop {
   return new AgentLoop({
@@ -57,6 +58,7 @@ function createLoop(
       onHistoryReplace: options.onHistoryReplace,
       compaction: options.compaction,
       additionalTools: options.additionalTools,
+      excludedTools: options.excludedTools,
     }),
     toolContext: { workspaceRoot },
     maxIterations: options.maxIterations,
@@ -131,6 +133,22 @@ describe("OpenAIProvider adapter", () => {
     expect(client.calls[0]?.tools).toContainEqual({ type: "web_search" });
     expect(client.calls[0]?.tools.some((tool) => tool.type === "function" && tool.name === "web_search"))
       .toBe(false);
+  });
+
+  it("filters parent-only functions from an OpenAI child provider", async () => {
+    const client = new FakeOpenAIProvider([openAIResponse([outputMessage("done")])]);
+    const loop = createLoop(client, [], workspaceRoot, {
+      excludedTools: ["run_subagent", "update_plan"],
+    });
+
+    await loop.runTurn("focused child task");
+
+    const tools = client.calls[0]?.tools ?? [];
+    expect(tools).toContainEqual(expect.objectContaining({ type: "function", name: "calculator" }));
+    expect(tools).not.toContainEqual(expect.objectContaining({ type: "function", name: "run_subagent" }));
+    expect(tools).not.toContainEqual(expect.objectContaining({ type: "function", name: "update_plan" }));
+    // web_search 是 Responses API 托管能力，不属于父 Agent 专用的函数工具。
+    expect(tools).toContainEqual({ type: "web_search" });
   });
 
   it("adds dynamically discovered MCP function tools", async () => {

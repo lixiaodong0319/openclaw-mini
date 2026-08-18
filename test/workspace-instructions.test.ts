@@ -105,6 +105,21 @@ describe("workspace instructions", () => {
     expect(buildSystemPrompt()).not.toContain("<current_task_plan");
   });
 
+  it("omits parent coordination instructions from a child Agent prompt", () => {
+    const prompt = buildSystemPrompt(
+      undefined,
+      undefined,
+      [],
+      undefined,
+      { includeAgentCoordination: false },
+    );
+
+    expect(prompt).not.toContain("use update_plan");
+    expect(prompt).not.toContain("call run_subagent");
+    // workspace 记忆等共享能力的说明仍保留。
+    expect(prompt).toContain("memory_search");
+  });
+
   it("adds MEMORY.md Markdown as bounded user context", () => {
     const prompt = buildSystemPrompt(undefined, {
       longTerm: {

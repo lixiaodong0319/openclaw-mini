@@ -269,10 +269,13 @@ export const WEB_PAGE = String.raw`<!doctype html>
     });
 
     function describeAgentEvent(event) {
-      if (event.type === "tool_start") return "[工具] " + event.name + " 执行中...";
-      if (event.type === "tool_approved") return "[工具] " + event.name + " 已允许";
-      if (event.type === "tool_denied") return "[工具] " + event.name + " 已拒绝";
-      if (event.type === "tool_end") return "[工具] " + event.name + (event.isError ? " 失败" : " 完成");
+      const toolPrefix = event.subagent ? "[子 Agent " + event.subagent + "] " : "[工具] ";
+      if (event.type === "tool_start") return toolPrefix + event.name + " 执行中...";
+      if (event.type === "tool_approved") return toolPrefix + event.name + " 已允许";
+      if (event.type === "tool_denied") return toolPrefix + event.name + " 已拒绝";
+      if (event.type === "tool_end") return toolPrefix + event.name + (event.isError ? " 失败" : " 完成");
+      if (event.type === "subagent_start") return "[子 Agent] " + event.agent + " 已启动：" + event.task;
+      if (event.type === "subagent_end") return "[子 Agent] " + event.agent + (event.isError ? " 失败" : " 完成");
       if (event.type === "context_compaction_start") return "[会话] 正在压缩上下文...";
       if (event.type === "context_compaction_end") return "[会话] 上下文压缩完成";
       if (event.type === "memory_flush_start") return "[记忆] 正在保存压缩前的重要信息...";
@@ -298,7 +301,8 @@ export const WEB_PAGE = String.raw`<!doctype html>
     function showConfirmation(payload, sessionId) {
       let input = JSON.stringify(payload.request.input, null, 2) ?? String(payload.request.input);
       if (input.length > 2000) input = input.slice(0, 2000) + "\n...（已截断）";
-      const view = appendMessage("工具确认", payload.request.name + "\n" + input);
+      const source = payload.request.subagent ? "子 Agent " + payload.request.subagent + " 请求：" : "";
+      const view = appendMessage("工具确认", source + payload.request.name + "\n" + input);
       const allow = document.createElement("button");
       const deny = document.createElement("button");
       allow.textContent = "允许";

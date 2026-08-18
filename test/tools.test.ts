@@ -752,6 +752,26 @@ describe("tools", () => {
     expect(requiresToolConfirmation("apply_patch")).toBe(true);
     expect(requiresToolConfirmation("fetch_url")).toBe(true);
     expect(requiresToolConfirmation("run_command")).toBe(true);
+    expect(requiresToolConfirmation("run_subagent")).toBe(true);
     expect(requiresToolConfirmation("shell")).toBe(true);
+  });
+
+  it("exposes run_subagent to both providers but keeps execution in AgentLoop", async () => {
+    expect(toolDefinitions).toContainEqual(expect.objectContaining({
+      name: "run_subagent",
+      input_schema: expect.objectContaining({
+        required: ["agent", "task"],
+      }),
+    }));
+    expect(openAIToolDefinitions).toContainEqual(expect.objectContaining({
+      type: "function",
+      name: "run_subagent",
+    }));
+
+    await expect(executeTool(
+      "run_subagent",
+      { agent: "test", task: "run focused tests" },
+      { workspaceRoot },
+    )).rejects.toThrow("run_subagent must be executed by AgentLoop");
   });
 });

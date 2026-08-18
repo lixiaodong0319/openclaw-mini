@@ -1,6 +1,6 @@
 # OpenClaw Mini
 
-一个用于学习 Agent 原理的最小 OpenClaw-like 本地助手。它不是官方 OpenClaw 的兼容实现，不包含 Gateway、插件、消息渠道或多 Agent 系统，只保留最核心的“模型调用 → 工具调用 → 工具结果回填 → 继续对话”循环。
+一个用于学习 Agent 原理的最小 OpenClaw-like 本地助手。它不是官方 OpenClaw 的兼容实现，不包含 Gateway、插件或消息渠道，聚焦“模型调用 → 工具调用 → 工具结果回填 → 继续对话”循环，并提供两个最小专用子 Agent。
 
 ## 功能
 
@@ -14,8 +14,9 @@
 - 启动时读取 `workspace/AGENTS.md`，作为 CLI 与 Web 共用的工作区指令
 - 扫描 `workspace/skills/*/SKILL.md`，按需加载可热刷新的任务技能
 - 为复杂任务维护按 Provider/Session 隔离、重启可恢复的任务计划
+- 可把独立验证或文档任务委派给临时 `test` / `docs` 子 Agent，报告回填主 Agent
 - 从项目根目录的 `mcp.json` 连接 stdio 或 Streamable HTTP MCP Server，并动态加载工具
-- 十七个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
+- 十八个本地工具；OpenAI 模式额外启用 Responses API 原生 Web Search：
   - `calculator`：执行加、减、乘、除
   - `list_directory`：浏览 `workspace/` 内的一层目录
   - `find_files`：按 glob 递归查找 `workspace/` 内的文件路径
@@ -23,6 +24,7 @@
   - `read_text_file`：读取 `workspace/` 内的 UTF-8 文本文件
   - `read_skill`：按名称读取已启用 Skill 的完整工作流指令
   - `update_plan`：创建或更新当前 Session 的多步骤任务计划
+  - `run_subagent`：确认后委派一个独立的测试或文档子任务
   - `memory_search`：用 SQLite FTS5/BM25 与可选 Embedding 混合检索全部 Markdown 记忆
   - `memory_get`：从 Markdown 真相源读取精确行范围
   - `git_status`：查看 `workspace/` 内 Git 仓库的分支和文件状态
@@ -47,7 +49,7 @@
 - OpenClaw Gateway / daemon
 - Slack、Discord、Telegram 等消息渠道
 - 文件删除或重命名工具
-- 浏览器、多 Agent
+- 浏览器自动化和通用多 Agent 编排
 - 模型 fallback、成本路由
 
 ## 目录结构
@@ -68,6 +70,7 @@ src/
   memory-flush.ts    压缩摘要的每日记忆落盘、去重和并发写入
   memory-consolidation.ts 每日记忆到 MEMORY.md 的提案、校验和确认写入
   skills.ts          workspace Skills 扫描、校验和按需读取
+  subagents.ts       test/docs 子 Agent 角色、参数与有界结果
   task-plan.ts       Session 任务计划持久化、校验和格式化
   workspace-memory.ts workspace/MEMORY.md 的加载、校验和注入预算
   provider.ts        Anthropic 与 OpenAI Provider 适配器
@@ -96,6 +99,7 @@ test/
   memory-flush.test.ts   压缩前记忆落盘、去重和安全边界测试
   memory-consolidation.test.ts 长期记忆整理、并发保护和凭据拦截测试
   skills.test.ts        Skills 发现、热刷新和安全边界测试
+  subagents.test.ts     子 Agent 参数、角色提示和 UTF-8 结果边界测试
   task-plan.test.ts     任务计划持久化、并发和安全边界测试
   workspace-memory.test.ts MEMORY.md 加载、UTF-8 边界和截断测试
   session-store.test.ts  会话存储测试
@@ -272,6 +276,25 @@ enabled: true
 
 计划独立保存到 `data/plans/<provider>/<session>.json`，不会混入 Anthropic/OpenAI 的原生 Session JSONL。重命名或删除 Session 时，对应计划会一起移动或清理。CLI 使用 `/plan` 查看、`/plan clear` 清除；Web 页面可以查看和清除计划，并通过 SSE 实时展示模型更新后的步骤。`update_plan` 只允许写宿主管理的计划状态，不能指定任意文件路径；其他写文件、Shell、网络和 MCP 工具仍遵守原有确认机制。
 
+### 子 Agent
+
+主 Agent 可以通过 `run_subagent` 委派一个聚焦任务：`test` 适合运行测试、分析失败和评估风险，`docs` 适合阅读实现、解释流程或编写文档。例如：
+
+```text
+> 请让测试 Agent 检查 calculator 相关测试，再让文档 Agent 解释 AgentLoop 的工具调度流程。
+```
+
+主模型可以在同一轮并行发起两个委派：
+
+```json
+{ "agent": "test", "task": "运行 calculator 相关测试，报告命令、结果和剩余风险" }
+{ "agent": "docs", "task": "阅读 src/agent-loop.ts 和 src/tools.ts，解释工具调度流程" }
+```
+
+每次委派都会创建空白的临时 Provider 历史，不读取或写入主 Session JSONL。子 Agent 共享 workspace、长期记忆、Skills 和 MCP，但看不到父任务计划，也无法调用 `run_subagent` 或 `update_plan`。主 Agent 负责用现有 `update_plan` 跟踪整体进度。
+
+`run_subagent` 本身需要用户确认；子 Agent 后续调用写文件、Shell、网络或 MCP 工具时，仍通过主会话的确认通道逐次询问。子 Agent 的中间正文不直接打印，最终报告作为有界 JSON 工具结果回填主模型，再由主模型整理给用户。子任务最大 8 KiB，报告字段最大 64 KiB。
+
 ### 长期记忆
 
 长期记忆使用 OpenClaw 风格的 Markdown 真相源：`workspace/MEMORY.md`。可以直接编辑：
@@ -417,7 +440,7 @@ workspace 中包含 note.txt。
 [会话] 上下文压缩完成（328400 → 62100 tokens）
 ```
 
-`calculator`、`list_directory`、`find_files`、`search_files`、`read_text_file`、`memory_search`、`memory_get`、`git_status` 和 `git_diff` 是无副作用工具，会自动执行。`create_directory`、`write_text_file`、`edit_text_file`、`apply_patch`、`fetch_url` 和 `run_command` 具有副作用，每次执行前都会显示调用参数并询问：
+`calculator`、`list_directory`、`find_files`、`search_files`、`read_text_file`、`memory_search`、`memory_get`、`git_status` 和 `git_diff` 是无副作用工具，会自动执行。`create_directory`、`write_text_file`、`edit_text_file`、`apply_patch`、`fetch_url`、`run_command` 和 `run_subagent` 需要确认，每次执行前都会显示调用参数并询问：
 
 ```text
 [工具] write_text_file 等待确认
